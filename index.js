@@ -3,7 +3,7 @@ const express = require("express");
 const line = require("@line/bot-sdk");
 const admin = require("firebase-admin");
 
-// ================= LINE =================
+/* ================= LINE ================= */
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
@@ -11,7 +11,7 @@ const config = {
 const client = new line.Client(config);
 const app = express();
 
-// ================= Firebase =================
+/* ================= Firebase ================= */
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
@@ -21,35 +21,20 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// ================= Utils =================
+/* ================= Utils ================= */
 const reply = (token, text) =>
   client.replyMessage(token, { type: "text", text });
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const normalizeText = (raw = "") =>
+  raw
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, "")
+    .normalize("NFKC");
 
-// ================= DB helpers =================
+/* ================= DB helpers ================= */
 async function isEngineer(userId) {
   const d = await db.collection("systemAdmins").doc(userId).get();
   return d.exists && d.data().canImpersonate === true;
-}
-
-async function getSession(userId) {
-  const d = await db.collection("sessions").doc(userId).get();
-  return d.exists ? d.data() : {};
-}
-
-async function setSession(userId, data) {
-  await db.collection("sessions").doc(userId).set(
-    {
-      ...data,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
-async function clearSession(userId) {
-  await db.collection("sessions").doc(userId).delete().catch(() => {});
 }
 
 async function getEmployeeByUserId(userId) {
@@ -63,12 +48,7 @@ async function getEmployeeByUserId(userId) {
   return { empNo: d.id, ...d.data() };
 }
 
-async function getEmployeeByEmpNo(empNo) {
-  const d = await db.collection("employees").doc(empNo).get();
-  return d.exists ? { empNo: d.id, ...d.data() } : null;
-}
-
-// ================= Webhook =================
+/* ================= Webhook ================= */
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
@@ -79,37 +59,28 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-// ================= Main =================
+/* ================= Main ================= */
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-  
-  console.log("🔥 REAL userId =", event.source.userId); 
-  const userId = event.source.userId;
-  const rawText = event.message.text || "";
-  const text = rawText
-    .replace(/[\u200B-\u200D\uFEFF]/g, "") // 清零寬字元
-    .replace(/\s+/g, "")                  // 清所有空白與換行
-    .normalize("NFKC");                   // 正規化字元
-  const token = event.replyToken;
-  const args = text.split(" ");
 
-  // ======================================================
-  // ① 工程師 HARD-OVERRIDE（最優先，完全獨立）
-  // ======================================================
+  const userId = event.source.userId;
+  const token = event.replyToken;
+  const text = normalizeText(event.message.text);
+
+  console.log("🔥 REAL userId =", userId);
+  console.log("📝 TEXT =", text);
+
+  /* =====================================================
+     ① 工程師 HARD OVERRIDE（無條件 return）
+     ===================================================== */
   const engineer = await isEngineer(userId);
   if (engineer) {
-    // 工程師指令「只要命中就 return」，不往下跑
-    if (text.replace(/\s/g, "") === "工程師模式") {
-      const s = await getSession(userId);
+    if (text === "工程師模式") {
       return reply(
         token,
         [
           "🧑‍💻 工程師模式（系統）",
-          s.impersonateEmpNo
-            ? `目前模擬：${s.impersonateEmpNo}`
-            : "目前：工程師本體",
           "",
-          "可用指令：",
           "模擬員工 A003",
           "模擬老闆 A001",
           "目前身分",
@@ -118,81 +89,45 @@ async function handleEvent(event) {
       );
     }
 
-    if (text.replace(/\s/g, "") === "目前身分") {
-      const s = await getSession(userId);
-      if (!s.impersonateEmpNo) {
-        return reply(token, "🧑‍💻 目前身分：工程師本體");
-      }
-      const emp = await getEmployeeByEmpNo(s.impersonateEmpNo);
-      return reply(
-        token,
-        `🧪 目前模擬：${emp.empNo}（${emp.role}）`
-      );
+    if (text === "目前身分") {
+      return reply(token, "🧑‍💻 目前身分：工程師本體");
     }
 
-    if (text.replace(/\s/g, "").startsWith("模擬員工")) {
-      const empNo = args[1];
-      const emp = await getEmployeeByEmpNo(empNo);
-      if (!emp || emp.role !== "staff") {
-        return reply(token, "❌ 找不到員工或身分不是員工");
-      }
-      await setSession(userId, { impersonateEmpNo: empNo });
-      return reply(token, `✅ 已模擬員工 ${empNo}`);
+    if (text.startsWith("模擬員工")) {
+      return reply(token, "🧪 已進入模擬員工模式（stub）");
     }
 
-    if (text.replace(/\s/g, "").startsWith("模擬老闆")) {
-      const empNo = args[1];
-      const emp = await getEmployeeByEmpNo(empNo);
-      if (!emp || emp.role !== "admin") {
-        return reply(token, "❌ 找不到老闆身分");
-      }
-      await setSession(userId, { impersonateEmpNo: empNo });
-      return reply(token, `✅ 已模擬老闆 ${empNo}`);
+    if (text.startsWith("模擬老闆")) {
+      return reply(token, "🧪 已進入模擬老闆模式（stub）");
     }
 
-    if (text.replace(/\s/g, "") === "退出模擬") {
-      await clearSession(userId);
+    if (text === "退出模擬") {
       return reply(token, "✅ 已退出模擬，回到工程師本體");
     }
-    // ⚠️ 工程師但不是工程師指令 → 繼續往下（模擬用）
+
+    // 🔥 關鍵：工程師身分 → 永遠不往下跑
+    return reply(
+      token,
+      "🧑‍💻 工程師模式中，請使用工程師指令"
+    );
   }
 
-  // ======================================================
-  // ② 決定「實際操作身分」
-  // ======================================================
-  let employee = null;
-  let impersonated = false;
-
-  if (engineer) {
-    const s = await getSession(userId);
-    if (!s.impersonateEmpNo) {
-      return reply(
-        token,
-        "🧑‍💻 你是工程師，請先輸入「工程師模式」並模擬身分"
-      );
-    }
-    employee = await getEmployeeByEmpNo(s.impersonateEmpNo);
-    impersonated = true;
-  } else {
-    employee = await getEmployeeByUserId(userId);
-  }
-
+  /* =====================================================
+     ② 一般員工 / 老闆流程
+     ===================================================== */
+  const employee = await getEmployeeByUserId(userId);
   if (!employee) {
     return reply(token, "尚未註冊身分");
   }
 
-  // ======================================================
-  // ③ 老闆模式
-  // ======================================================
+  /* ---------------- 老闆 ---------------- */
   if (employee.role === "admin") {
     if (text === "老闆") {
       return reply(
         token,
         [
           "👑 老闆模式",
-          impersonated ? "（工程師模擬）" : "",
           "",
-          "指令：",
           "新增員工 A002 小明",
           "設定早班 A001 2025-12-12 10:00 14:30",
           "設定晚班 A001 2025-12-12 17:00 21:30",
@@ -203,16 +138,9 @@ async function handleEvent(event) {
     return reply(token, "老闆指令不正確，輸入：老闆");
   }
 
-  // ======================================================
-  // ④ 員工模式
-  // ======================================================
+  /* ---------------- 員工 ---------------- */
   if (text === "今日") {
-    return reply(
-      token,
-      `📋 今日 ${todayStr()}\n員工：${employee.empNo}${
-        impersonated ? "（工程師模擬）" : ""
-      }`
-    );
+    return reply(token, `📋 今日出勤\n員工：${employee.empNo}`);
   }
 
   return reply(
@@ -226,9 +154,9 @@ async function handleEvent(event) {
   );
 }
 
-// ================= Server =================
+/* ================= Server ================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log("🔥 ENGINEER HARD OVERRIDE VERSION v1");
+  console.log("🚀 Server running on port", PORT);
+  console.log("🔥 ENGINEER HARD OVERRIDE FINAL");
 });
