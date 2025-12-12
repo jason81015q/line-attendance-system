@@ -21,6 +21,10 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
+/* ================= 設定：工程師 userId（硬鎖） ================= */
+// ⚠️ 這裡一定要是 Render log 印出的 REAL userId
+const ENGINEER_USER_ID = "U76d79bf56f77fdb1c5b9e00a735d3a26";
+
 /* ================= Utils ================= */
 const reply = (token, text) =>
   client.replyMessage(token, { type: "text", text });
@@ -30,23 +34,6 @@ const normalizeText = (raw = "") =>
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\s+/g, "")
     .normalize("NFKC");
-
-/* ================= DB helpers ================= */
-async function isEngineer(userId) {
-  const d = await db.collection("systemAdmins").doc(userId).get();
-  return d.exists && d.data().canImpersonate === true;
-}
-
-async function getEmployeeByUserId(userId) {
-  const q = await db
-    .collection("employees")
-    .where("userId", "==", userId)
-    .limit(1)
-    .get();
-  if (q.empty) return null;
-  const d = q.docs[0];
-  return { empNo: d.id, ...d.data() };
-}
 
 /* ================= Webhook ================= */
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -71,92 +58,71 @@ async function handleEvent(event) {
   console.log("📝 TEXT =", text);
 
   /* =====================================================
-     ① 工程師 HARD OVERRIDE（無條件 return）
+     ① 工程師「最硬強制模式」
+     👉 不查 Firestore
+     👉 不看 employee
+     👉 不看 role
+     👉 只看 userId + 指令
      ===================================================== */
-  const engineer = await isEngineer(userId);
-  if (engineer) {
+  if (userId === ENGINEER_USER_ID) {
     if (text === "工程師模式") {
       return reply(
         token,
         [
-          "🧑‍💻 工程師模式（系統）",
+          "🧑‍💻 工程師強制模式（HARD OVERRIDE）",
           "",
-          "模擬員工 A003",
-          "模擬老闆 A001",
-          "目前身分",
-          "退出模擬",
+          "這一版已完全繞過：",
+          "- 老闆 / 員工",
+          "- Firestore 權限",
+          "- 身分判斷",
+          "",
+          "可用指令：",
+          "工程師模式",
+          "工程師測試",
         ].join("\n")
       );
     }
 
-    if (text === "目前身分") {
-      return reply(token, "🧑‍💻 目前身分：工程師本體");
+    if (text === "工程師測試") {
+      return reply(token, "✅ 工程師指令 100% 生效");
     }
 
-    if (text.startsWith("模擬員工")) {
-      return reply(token, "🧪 已進入模擬員工模式（stub）");
-    }
-
-    if (text.startsWith("模擬老闆")) {
-      return reply(token, "🧪 已進入模擬老闆模式（stub）");
-    }
-
-    if (text === "退出模擬") {
-      return reply(token, "✅ 已退出模擬，回到工程師本體");
-    }
-
-    // 🔥 關鍵：工程師身分 → 永遠不往下跑
-    return reply(
-      token,
-      "🧑‍💻 工程師模式中，請使用工程師指令"
-    );
+    // 🔥 工程師 userId → 不論輸入什麼，都不往下跑
+    return reply(token, "🧑‍💻 工程師硬鎖模式中");
   }
 
   /* =====================================================
-     ② 一般員工 / 老闆流程
+     ② 一般流程（現在一定不會影響工程師）
      ===================================================== */
-  const employee = await getEmployeeByUserId(userId);
-  if (!employee) {
+  const snap = await db
+    .collection("employees")
+    .where("userId", "==", userId)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
     return reply(token, "尚未註冊身分");
   }
 
-  /* ---------------- 老闆 ---------------- */
-  if (employee.role === "admin") {
+  const emp = { empNo: snap.docs[0].id, ...snap.docs[0].data() };
+
+  if (emp.role === "admin") {
     if (text === "老闆") {
-      return reply(
-        token,
-        [
-          "👑 老闆模式",
-          "",
-          "新增員工 A002 小明",
-          "設定早班 A001 2025-12-12 10:00 14:30",
-          "設定晚班 A001 2025-12-12 17:00 21:30",
-          "補打卡列表",
-        ].join("\n")
-      );
+      return reply(token, "👑 老闆模式（正常）");
     }
     return reply(token, "老闆指令不正確，輸入：老闆");
   }
 
-  /* ---------------- 員工 ---------------- */
   if (text === "今日") {
-    return reply(token, `📋 今日出勤\n員工：${employee.empNo}`);
+    return reply(token, `📋 今日出勤\n員工：${emp.empNo}`);
   }
 
-  return reply(
-    token,
-    [
-      "員工指令：",
-      "今日",
-      "早班上班 / 早班下班",
-      "晚班上班 / 晚班下班",
-    ].join("\n")
-  );
+  return reply(token, "員工指令不正確");
 }
 
 /* ================= Server ================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🚀 Server running on port", PORT);
-  console.log("🔥 ENGINEER HARD OVERRIDE FINAL");
+  console.log("🔥 ENGINEER ABSOLUTE HARD MODE");
 });
