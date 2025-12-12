@@ -21,19 +21,56 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-/* ================= 設定：工程師 userId（硬鎖） ================= */
-// ⚠️ 這裡一定要是 Render log 印出的 REAL userId
-const ENGINEER_USER_ID = "U76d79bf56f77fdb1c5b9e00a735d3a26";
-
 /* ================= Utils ================= */
-const reply = (token, text) =>
-  client.replyMessage(token, { type: "text", text });
+const reply = (token, message) =>
+  client.replyMessage(token, message);
 
 const normalizeText = (raw = "") =>
   raw
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\s+/g, "")
     .normalize("NFKC");
+
+const todayStr = () =>
+  new Date().toISOString().slice(0, 10);
+
+/* ================= Helpers ================= */
+async function getEmployeeByUserId(userId) {
+  const q = await db
+    .collection("employees")
+    .where("userId", "==", userId)
+    .limit(1)
+    .get();
+
+  if (q.empty) return null;
+  const d = q.docs[0];
+  return { empNo: d.id, ...d.data() };
+}
+
+async function writeAttendance(empNo, shift, type) {
+  const date = todayStr();
+  const docId = `${empNo}_${date}`;
+  const ref = db.collection("attendance").doc(docId);
+
+  const fieldPath = `shift.${shift}.${type}`;
+
+  await ref.set(
+    {
+      empNo,
+      date,
+      shift: {
+        morning: { checkIn: null, checkOut: null },
+        night: { checkIn: null, checkOut: null },
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await ref.update({
+    [fieldPath]: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
 
 /* ================= Webhook ================= */
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -50,79 +87,81 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
 
+  // 👉 員工打卡「建議只私聊」，先保守
+  if (event.source.type !== "user") {
+    return reply(event.replyToken, {
+      type: "text",
+      text: "⚠️ 打卡請私聊官方帳進行",
+    });
+  }
+
   const userId = event.source.userId;
   const token = event.replyToken;
   const text = normalizeText(event.message.text);
 
-  console.log("🔥 REAL userId =", userId);
-  console.log("📝 TEXT =", text);
-
-  /* =====================================================
-     ① 工程師「最硬強制模式」
-     👉 不查 Firestore
-     👉 不看 employee
-     👉 不看 role
-     👉 只看 userId + 指令
-     ===================================================== */
-  if (userId === ENGINEER_USER_ID) {
-    if (text === "工程師模式") {
-      return reply(
-        token,
-        [
-          "🧑‍💻 工程師強制模式（HARD OVERRIDE）",
-          "",
-          "這一版已完全繞過：",
-          "- 老闆 / 員工",
-          "- Firestore 權限",
-          "- 身分判斷",
-          "",
-          "可用指令：",
-          "工程師模式",
-          "工程師測試",
-        ].join("\n")
-      );
-    }
-
-    if (text === "工程師測試") {
-      return reply(token, "✅ 工程師指令 100% 生效");
-    }
-
-    // 🔥 工程師 userId → 不論輸入什麼，都不往下跑
-    return reply(token, "🧑‍💻 工程師硬鎖模式中");
+  const employee = await getEmployeeByUserId(userId);
+  if (!employee) {
+    return reply(token, {
+      type: "text",
+      text: "❌ 尚未註冊員工身分",
+    });
   }
 
-  /* =====================================================
-     ② 一般流程（現在一定不會影響工程師）
-     ===================================================== */
-  const snap = await db
-    .collection("employees")
-    .where("userId", "==", userId)
-    .limit(1)
-    .get();
-
-  if (snap.empty) {
-    return reply(token, "尚未註冊身分");
+  /* ================= Quick Reply 主選單 ================= */
+  if (text === "打卡" || text === "開始") {
+    return reply(token, {
+      type: "text",
+      text: `👷 員工 ${employee.empNo}\n請選擇打卡項目：`,
+      quickReply: {
+        items: [
+          { type: "action", action: { type: "message", label: "早班上班", text: "早班上班" } },
+          { type: "action", action: { type: "message", label: "早班下班", text: "早班下班" } },
+          { type: "action", action: { type: "message", label: "晚班上班", text: "晚班上班" } },
+          { type: "action", action: { type: "message", label: "晚班下班", text: "晚班下班" } },
+          { type: "action", action: { type: "message", label: "今日狀態", text: "今日狀態" } },
+        ],
+      },
+    });
   }
 
-  const emp = { empNo: snap.docs[0].id, ...snap.docs[0].data() };
-
-  if (emp.role === "admin") {
-    if (text === "老闆") {
-      return reply(token, "👑 老闆模式（正常）");
-    }
-    return reply(token, "老闆指令不正確，輸入：老闆");
+  /* ================= 打卡行為 ================= */
+  if (text === "早班上班") {
+    await writeAttendance(employee.empNo, "morning", "checkIn");
+    return reply(token, { type: "text", text: "✅ 早班上班打卡完成" });
   }
 
-  if (text === "今日") {
-    return reply(token, `📋 今日出勤\n員工：${emp.empNo}`);
+  if (text === "早班下班") {
+    await writeAttendance(employee.empNo, "morning", "checkOut");
+    return reply(token, { type: "text", text: "✅ 早班下班打卡完成" });
   }
 
-  return reply(token, "員工指令不正確");
+  if (text === "晚班上班") {
+    await writeAttendance(employee.empNo, "night", "checkIn");
+    return reply(token, { type: "text", text: "✅ 晚班上班打卡完成" });
+  }
+
+  if (text === "晚班下班") {
+    await writeAttendance(employee.empNo, "night", "checkOut");
+    return reply(token, { type: "text", text: "✅ 晚班下班打卡完成" });
+  }
+
+  if (text === "今日狀態") {
+    return reply(token, {
+      type: "text",
+      text: `📅 今日 ${todayStr()}\n狀態已記錄（詳情下一步補）`,
+    });
+  }
+
+  /* ================= fallback ================= */
+  return reply(token, {
+    type: "text",
+    text: "請點選按鍵操作\n輸入「打卡」開始",
+  });
 }
 
 /* ================= Server ================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🚀 Server running on port", PORT);
-  console.log("🔥 ENGINEER ABSOLUTE HARD MODE");
+  console.log("🟢 EMPLOYEE QUICK CHECK-IN READY");
 });
