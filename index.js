@@ -1,84 +1,56 @@
 require("dotenv").config();
 const express = require("express");
 const line = require("@line/bot-sdk");
-const admin = require("firebase-admin");
 
-// ------------------- LINE Bot 設定 -------------------
+const app = express();
+
+/**
+ * 關鍵：保留 raw body，避免 SignatureValidationFailed
+ */
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
+// LINE Bot 設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 
 const client = new line.Client(config);
-const app = express();
-app.use(express.json());
 
-// ------------------- Firebase 初始化 -------------------
-admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-  })
+// 健康檢查（用瀏覽器開網址會看到 OK）
+app.get("/", (req, res) => {
+  res.send("OK");
 });
 
-const db = admin.firestore();
-
-// ------------------- Webhook -------------------
+// Webhook（只做一件事：回話）
 app.post("/webhook", line.middleware(config), async (req, res) => {
-
-  // ★★★★★ 用來偵錯 Webhook 是否收到事件 ★★★★★
-  console.log("💬 收到 LINE Webhook：", JSON.stringify(req.body.events, null, 2));
-
   try {
-    const results = await Promise.all(req.body.events.map(handleEvent));
-    res.json(results);
+    console.log("💬 Webhook events:", JSON.stringify(req.body.events, null, 2));
+
+    for (const event of req.body.events || []) {
+      if (event.type === "message" && event.message.type === "text") {
+        await client.replyMessage(event.replyToken, {
+          type: "text",
+          text: `收到你的訊息：${event.message.text}`,
+        });
+      }
+    }
+
+    res.status(200).end();
   } catch (err) {
-    console.error("❌ Webhook Error:", err);
+    console.error("❌ Webhook error:", err);
     res.status(500).end();
   }
 });
 
-// ------------------- 處理 LINE 訊息事件 -------------------
-async function handleEvent(event) {
-  if (event.type !== "message" || event.message.type !== "text") return;
-
-  const userMessage = event.message.text.trim();
-  const userId = event.source.userId;
-
-  // 取得 Firebase employeeId (先查 employees 集合)
-  let employeeId = "UNKNOWN";
-
-  const employeeSnap = await db.collection("employees").where("userId", "==", userId).get();
-  if (!employeeSnap.empty) {
-    employeeId = employeeSnap.docs[0].data().employeeId;
-  }
-
-  // 若訊息是「打卡」
-  if (userMessage === "打卡") {
-    const timestamp = new Date();
-
-    // 寫入 Firebase attendance 集合
-    await db.collection("attendance").add({
-      userId,
-      employeeId,
-      timestamp,
-      type: "check-in"
-    });
-
-    return client.replyMessage(event.replyToken, {
-      type: "text",
-      text: `✅ 已成功打卡！\n員工編號：${employeeId}\n時間：${timestamp.toLocaleString("zh-TW")}`
-    });
-  }
-
-  // 其他訊息回應
-  return client.replyMessage(event.replyToken, {
-    type: "text",
-    text: `你說：「${userMessage}」\n（目前只有「打卡」功能喔）`
-  });
-}
-
-// ------------------- Render 用的伺服器啟動 -------------------
+// 啟動
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
