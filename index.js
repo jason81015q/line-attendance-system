@@ -11,7 +11,6 @@ const config = {
 
 const client = new line.Client(config);
 const app = express();
-
 // ❗ webhook 前不能用 express.json()
 
 // ------------------- Firebase 初始化 -------------------
@@ -37,39 +36,107 @@ function normalizeText(s) {
 }
 
 function isValidDate(dateStr) {
-  // YYYY-MM-DD
   return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
 }
 
 function isValidMonth(monthStr) {
-  // YYYY-MM
   return /^\d{4}-\d{2}$/.test(monthStr);
 }
 
 function isValidTime(timeStr) {
-  // HH:MM 00-23 00-59
   if (!/^\d{2}:\d{2}$/.test(timeStr)) return false;
   const [h, m] = timeStr.split(":").map((x) => Number(x));
   return h >= 0 && h <= 23 && m >= 0 && m <= 59;
 }
 
 function parseCommand(text) {
-  // 支援「指令 參數1 參數2...」
   const t = normalizeText(text);
   const parts = t.split(" ");
   return { raw: t, cmd: parts[0] || "", args: parts.slice(1) };
 }
 
-// 依 userId 找到員工（employees 的 docId 是 A001 這種編號）
+function replyText(replyToken, text) {
+  return client.replyMessage(replyToken, { type: "text", text });
+}
+
+function formatTs(ts) {
+  try {
+    if (!ts) return "—";
+    if (typeof ts === "string") return ts;
+    if (ts.toDate) return ts.toDate().toLocaleString("zh-TW");
+    if (ts instanceof Date) return ts.toLocaleString("zh-TW");
+    return String(ts);
+  } catch {
+    return String(ts);
+  }
+}
+
+function safeToISO(ts) {
+  try {
+    if (!ts) return null;
+    if (typeof ts === "string") return ts;
+    if (ts.toDate) return ts.toDate().toISOString();
+    if (ts instanceof Date) return ts.toISOString();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function attendanceDocId(empNo, dateStr) {
+  return `${empNo}_${dateStr}`;
+}
+
+function scheduleDocId(empNo, dateStr) {
+  return `${empNo}_${dateStr}`;
+}
+
+function pendingDocId(userId) {
+  return userId; // pendingActions/{userId}
+}
+
+function toDateAt(dateStr, timeStr) {
+  const [hh, mm] = timeStr.split(":").map(Number);
+  const dt = new Date(dateStr);
+  dt.setHours(hh, mm, 0, 0);
+  return dt;
+}
+
+function minutesDiff(a, b) {
+  // a - b in minutes
+  return Math.round((a - b) / 60000);
+}
+
+// Q1= A：1分鐘就算遲到（所以不做寬限）
+function calcLateMinutes(checkIn, shiftStart, dateStr) {
+  if (!checkIn || !shiftStart) return 0;
+  const start = toDateAt(dateStr, shiftStart);
+  const diff = minutesDiff(checkIn, start);
+  return diff > 0 ? diff : 0;
+}
+
+// ±60分鐘內顯示 0；純顯示
+function calcOvertimeEarlyLeave(checkOut, shiftEnd, dateStr) {
+  if (!checkOut || !shiftEnd) return { overtimeMinutes: 0, earlyLeaveMinutes: 0 };
+
+  const end = toDateAt(dateStr, shiftEnd);
+
+  // 避免跨日誤判：超過當天 23:59 一律視為 23:59
+  const endOfDay = new Date(dateStr);
+  endOfDay.setHours(23, 59, 59, 999);
+  const effectiveCheckOut = checkOut > endOfDay ? endOfDay : checkOut;
+
+  const diff = minutesDiff(effectiveCheckOut, end);
+
+  if (Math.abs(diff) <= 60) return { overtimeMinutes: 0, earlyLeaveMinutes: 0 };
+  if (diff > 60) return { overtimeMinutes: diff, earlyLeaveMinutes: 0 };
+  return { overtimeMinutes: 0, earlyLeaveMinutes: Math.abs(diff) };
+}
+
+// ------------------- Firestore 查詢 -------------------
 async function getEmployeeByUserId(userId) {
-  const snap = await db
-    .collection("employees")
-    .where("userId", "==", userId)
-    .limit(1)
-    .get();
-
+  const snap = await db.collection("employees").where("userId", "==", userId).limit(1).get();
   if (snap.empty) return null;
-
   const doc = snap.docs[0];
   return { empNo: doc.id, ...doc.data() };
 }
@@ -80,20 +147,27 @@ async function getEmployeeByEmpNo(empNo) {
   return { empNo: doc.id, ...doc.data() };
 }
 
-function attendanceDocId(empNo, dateStr) {
-  return `${empNo}_${dateStr}`;
-}
-
-// 取某日排班（預留結構：schedules/{empNo}_{YYYY-MM-DD}）
 async function getSchedule(empNo, dateStr) {
-  const docId = `${empNo}_${dateStr}`;
-  const snap = await db.collection("schedules").doc(docId).get();
-  return snap.exists ? snap.data() : null;
+  const doc = await db.collection("schedules").doc(scheduleDocId(empNo, dateStr)).get();
+  return doc.exists ? doc.data() : null;
 }
 
-// 回覆快捷
-function replyText(replyToken, text) {
-  return client.replyMessage(replyToken, { type: "text", text });
+function getShiftKeyFromLabel(label) {
+  // 早班/晚班 -> morning/evening
+  if (label === "早班") return "morning";
+  if (label === "晚班") return "evening";
+  return null;
+}
+
+function shiftLabel(key) {
+  return key === "morning" ? "早班" : key === "evening" ? "晚班" : key;
+}
+
+function getShiftFromSchedule(schedule, shiftKey) {
+  if (!schedule || !schedule.shifts || !schedule.shifts[shiftKey]) return null;
+  const s = schedule.shifts[shiftKey];
+  if (s && s.enabled === false) return null;
+  return s;
 }
 
 // ------------------- Webhook -------------------
@@ -107,6 +181,115 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
+// ------------------- 核心：打卡（寫入 records.morning / records.evening） -------------------
+async function applyPunch({ empNo, userId, dateStr, shiftKey, action, at, byAdmin, note, adminEmpNo }) {
+  const attRef = db.collection("attendance").doc(attendanceDocId(empNo, dateStr));
+  const attSnap = await attRef.get();
+  const att = attSnap.exists ? attSnap.data() : {};
+
+  const schedule = await getSchedule(empNo, dateStr);
+  const shift = getShiftFromSchedule(schedule, shiftKey);
+
+  // 如果沒排班，仍允許打卡（先記錄），但計算會是 0
+  const pathBase = `records.${shiftKey}`;
+  const cur = (att.records && att.records[shiftKey]) ? att.records[shiftKey] : {};
+
+  if (action === "checkIn" && cur.checkIn) {
+    return { ok: false, msg: `${shiftLabel(shiftKey)}今天已上班打卡過了` };
+  }
+  if (action === "checkOut") {
+    if (!cur.checkIn && !byAdmin) {
+      return { ok: false, msg: `❌ ${shiftLabel(shiftKey)}尚未上班打卡，無法下班` };
+    }
+    if (cur.checkOut) {
+      return { ok: false, msg: `${shiftLabel(shiftKey)}今天已下班打卡過了` };
+    }
+  }
+
+  const updates = {
+    empNo,
+    userId: userId || null,
+    date: dateStr,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  updates[`${pathBase}.${action}`] = at;
+
+  // 同步班表到 attendance（方便查詢）
+  if (shift) {
+    updates[`${pathBase}.shiftStart`] = shift.start || null;
+    updates[`${pathBase}.shiftEnd`] = shift.end || null;
+  } else {
+    // 沒班表就保留原本（不覆蓋），避免你先設過
+  }
+
+  // 計算（純顯示 / 遲到會進薪資：先存 lateMinutes，扣薪留到 Step 3）
+  const shiftStart = shift ? shift.start : (cur.shiftStart || null);
+  const shiftEnd = shift ? shift.end : (cur.shiftEnd || null);
+
+  if (action === "checkIn") {
+    const lateMinutes = calcLateMinutes(at, shiftStart, dateStr);
+    updates[`${pathBase}.lateMinutes`] = lateMinutes;
+  }
+
+  if (action === "checkOut") {
+    const { overtimeMinutes, earlyLeaveMinutes } = calcOvertimeEarlyLeave(at, shiftEnd, dateStr);
+    updates[`${pathBase}.overtimeMinutes`] = overtimeMinutes;
+    updates[`${pathBase}.earlyLeaveMinutes`] = earlyLeaveMinutes;
+  }
+
+  // 管理員操作紀錄（補打卡一定留下）
+  if (byAdmin) {
+    updates["adminEdits"] = admin.firestore.FieldValue.arrayUnion({
+      shiftKey,
+      type: action,
+      setTo: at.toISOString(),
+      before: cur && cur[action] ? safeToISO(cur[action]) : null,
+      note: note || "",
+      adminEmpNo: adminEmpNo || null,
+      at: new Date().toISOString(),
+    });
+  }
+
+  await attRef.set(updates, { merge: true });
+
+  // 回傳一段訊息給呼叫者
+  const afterSnap = await attRef.get();
+  const after = afterSnap.data();
+  const afterShift = after.records?.[shiftKey] || {};
+
+  const lines = [];
+  lines.push(`✅ ${shiftLabel(shiftKey)}${action === "checkIn" ? "上班" : "下班"}成功`);
+  if (action === "checkIn") {
+    lines.push(`遲到：${afterShift.lateMinutes || 0} 分鐘`);
+  }
+  if (action === "checkOut") {
+    const ot = afterShift.overtimeMinutes || 0;
+    const el = afterShift.earlyLeaveMinutes || 0;
+    lines.push(`加班：${ot} 分鐘（純顯示）`);
+    lines.push(`早退：${el} 分鐘（純顯示）`);
+  }
+
+  return { ok: true, msg: lines.join("\n") };
+}
+
+// ------------------- Pending（避免點錯班別：先確認再寫入） -------------------
+async function setPending(userId, payload) {
+  await db.collection("pendingActions").doc(pendingDocId(userId)).set({
+    ...payload,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function getPending(userId) {
+  const doc = await db.collection("pendingActions").doc(pendingDocId(userId)).get();
+  return doc.exists ? doc.data() : null;
+}
+
+async function clearPending(userId) {
+  await db.collection("pendingActions").doc(pendingDocId(userId)).delete().catch(() => {});
+}
+
 // ------------------- 主要處理 -------------------
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;
@@ -116,12 +299,10 @@ async function handleEvent(event) {
   const today = getTodayDate();
   const { cmd, args } = parseCommand(userMessage);
 
-  // 先找員工資料（你現在是 employees/A001 裡有 userId）
+  // 找員工
   const employee = await getEmployeeByUserId(userId);
 
-  // ------------------- 未註冊流程（員工自助綁定） -------------------
-  // 讓新人自己輸入：註冊 A001（把 LINE userId 綁到 employees/A001）
-  //（掃碼註冊你之後要做也行，但此版先用文字綁定）
+  // 未註冊：允許「註冊 A001」
   if (!employee) {
     if (cmd === "註冊") {
       const empNo = (args[0] || "").toUpperCase();
@@ -129,59 +310,73 @@ async function handleEvent(event) {
 
       const target = await getEmployeeByEmpNo(empNo);
       if (!target) {
-        return replyText(
-          event.replyToken,
-          `找不到員工編號 ${empNo}\n請請老闆先建立員工資料：新增員工 ${empNo} 姓名`
-        );
+        return replyText(event.replyToken, `找不到員工編號 ${empNo}\n請老闆先建立：新增員工 ${empNo} 姓名`);
       }
       if (target.userId && target.userId !== userId) {
-        return replyText(
-          event.replyToken,
-          `此員工編號 ${empNo} 已被其他帳號綁定，請老闆處理`
-        );
+        return replyText(event.replyToken, `此員工編號 ${empNo} 已被其他帳號綁定，請老闆處理`);
       }
 
       await db.collection("employees").doc(empNo).set(
-        {
-          userId,
-          active: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
+        { userId, active: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
-
       return replyText(event.replyToken, `✅ 註冊完成，你的員工編號：${empNo}`);
     }
 
-    return replyText(
-      event.replyToken,
-      "你尚未註冊。\n請輸入：註冊 A001\n（A001 請向老闆取得）"
-    );
+    return replyText(event.replyToken, "你尚未註冊。\n請輸入：註冊 A001\n（A001 向老闆取得）");
   }
 
-  // ------------------- 角色判斷（老闆模式） -------------------
-  // 你可以在 Firestore employees/{empNo}.role 設 admin
   const isAdmin = employee.role === "admin";
 
-  // ------------------- 老闆模式指令 -------------------
+  // 先處理 Pending：確認/取消
+  if (cmd === "確認" || cmd === "取消") {
+    const pending = await getPending(userId);
+    if (!pending) return replyText(event.replyToken, "目前沒有待確認的操作");
+
+    if (cmd === "取消") {
+      await clearPending(userId);
+      return replyText(event.replyToken, "✅ 已取消");
+    }
+
+    // 確認
+    await clearPending(userId);
+    const { empNo, dateStr, shiftKey, action } = pending;
+    const at = new Date();
+    const r = await applyPunch({
+      empNo,
+      userId,
+      dateStr,
+      shiftKey,
+      action,
+      at,
+      byAdmin: false,
+    });
+    return replyText(event.replyToken, r.msg);
+  }
+
+  // ------------------- 老闆模式 -------------------
   if (isAdmin) {
     if (cmd === "老闆" || cmd === "admin") {
       return replyText(
         event.replyToken,
         [
-          "👑 老闆模式指令：",
-          "1) 新增員工 A002 小明",
-          "2) 設定班表 A001 2025-12-12 14:30 21:30",
-          "3) 查今日 A001（不給日期 = 今天）",
-          "4) 查月報 A001 2025-12",
-          "5) 補上班 A001 2025-12-12 14:32 備註",
-          "6) 補下班 A001 2025-12-12 21:28 備註",
-          "7) 視為正常 A001 2025-12-12 備註",
+          "👑 老闆模式（建議之後做成按鍵）",
+          "新增員工 A002 小明",
+          "設定早班 A001 2025-12-12 10:00 14:30",
+          "設定晚班 A001 2025-12-12 17:00 21:30",
+          "關閉早班 A001 2025-12-12（颱風半天用）",
+          "關閉晚班 A001 2025-12-12（颱風半天用）",
+          "查今日 A001（或 查今日 A001 2025-12-12）",
+          "查月報 A001 2025-12",
+          "補早上班 A001 2025-12-12 10:03 備註",
+          "補早下班 A001 2025-12-12 14:31 備註",
+          "補晚上班 A001 2025-12-12 17:00 備註",
+          "補晚下班 A001 2025-12-12 21:28 備註",
+          "視為正常 A001 2025-12-12 備註",
         ].join("\n")
       );
     }
 
-    // 新增員工 <編號> <姓名(可省略)>
     if (cmd === "新增員工") {
       const empNo = (args[0] || "").toUpperCase();
       const name = args.slice(1).join(" ").trim() || "";
@@ -189,9 +384,7 @@ async function handleEvent(event) {
 
       const ref = db.collection("employees").doc(empNo);
       const snap = await ref.get();
-      if (snap.exists) {
-        return replyText(event.replyToken, `⚠️ ${empNo} 已存在`);
-      }
+      if (snap.exists) return replyText(event.replyToken, `⚠️ ${empNo} 已存在`);
 
       await ref.set({
         empNo,
@@ -201,45 +394,64 @@ async function handleEvent(event) {
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      return replyText(
-        event.replyToken,
-        `✅ 已新增員工：${empNo}${name ? " " + name : ""}\n（員工本人需輸入：註冊 ${empNo}）`
-      );
+      return replyText(event.replyToken, `✅ 已新增員工：${empNo}${name ? " " + name : ""}\n員工需輸入：註冊 ${empNo}`);
     }
 
-    // 設定班表 <編號> <YYYY-MM-DD> <HH:MM> <HH:MM>
-    if (cmd === "設定班表") {
+    // 設定早班/晚班 <編號> <YYYY-MM-DD> <start> <end>
+    if (cmd === "設定早班" || cmd === "設定晚班") {
+      const shiftKey = cmd === "設定早班" ? "morning" : "evening";
       const empNo = (args[0] || "").toUpperCase();
       const dateStr = args[1] || "";
       const start = args[2] || "";
       const end = args[3] || "";
 
       if (!empNo || !dateStr || !start || !end) {
-        return replyText(
-          event.replyToken,
-          "格式：設定班表 A001 2025-12-12 14:30 21:30"
-        );
+        return replyText(event.replyToken, `格式：${cmd} A001 2025-12-12 10:00 14:30`);
       }
       if (!isValidDate(dateStr)) return replyText(event.replyToken, "日期格式錯誤，需 YYYY-MM-DD");
-      if (!isValidTime(start) || !isValidTime(end))
-        return replyText(event.replyToken, "時間格式錯誤，需 HH:MM");
-
+      if (!isValidTime(start) || !isValidTime(end)) return replyText(event.replyToken, "時間格式錯誤，需 HH:MM");
       const emp = await getEmployeeByEmpNo(empNo);
       if (!emp) return replyText(event.replyToken, `找不到員工：${empNo}`);
 
-      const docId = `${empNo}_${dateStr}`;
-      await db.collection("schedules").doc(docId).set({
-        empNo,
-        date: dateStr,
-        shiftStart: start,
-        shiftEnd: end,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return replyText(
-        event.replyToken,
-        `✅ 已設定班表：${empNo} ${dateStr} ${start}~${end}`
+      const ref = db.collection("schedules").doc(scheduleDocId(empNo, dateStr));
+      await ref.set(
+        {
+          empNo,
+          date: dateStr,
+          shifts: {
+            [shiftKey]: { start, end, enabled: true },
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
       );
+
+      return replyText(event.replyToken, `✅ 已設定${shiftLabel(shiftKey)}：${empNo} ${dateStr} ${start}~${end}`);
+    }
+
+    // 關閉早班/晚班 <編號> <YYYY-MM-DD>
+    if (cmd === "關閉早班" || cmd === "關閉晚班") {
+      const shiftKey = cmd === "關閉早班" ? "morning" : "evening";
+      const empNo = (args[0] || "").toUpperCase();
+      const dateStr = args[1] || "";
+
+      if (!empNo || !dateStr) return replyText(event.replyToken, `格式：${cmd} A001 2025-12-12`);
+      if (!isValidDate(dateStr)) return replyText(event.replyToken, "日期格式錯誤，需 YYYY-MM-DD");
+
+      const ref = db.collection("schedules").doc(scheduleDocId(empNo, dateStr));
+      await ref.set(
+        {
+          empNo,
+          date: dateStr,
+          shifts: {
+            [shiftKey]: { enabled: false },
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return replyText(event.replyToken, `✅ 已關閉${shiftLabel(shiftKey)}：${empNo} ${dateStr}`);
     }
 
     // 查今日 <編號> [YYYY-MM-DD]
@@ -249,29 +461,43 @@ async function handleEvent(event) {
       if (!empNo) return replyText(event.replyToken, "格式：查今日 A001（或 查今日 A001 2025-12-12）");
       if (!isValidDate(dateStr)) return replyText(event.replyToken, "日期格式錯誤，需 YYYY-MM-DD");
 
-      const doc = await db.collection("attendance").doc(attendanceDocId(empNo, dateStr)).get();
+      const attDoc = await db.collection("attendance").doc(attendanceDocId(empNo, dateStr)).get();
       const sch = await getSchedule(empNo, dateStr);
 
-      if (!doc.exists) {
-        return replyText(
-          event.replyToken,
-          `📋 ${empNo} ${dateStr}\n尚無打卡紀錄` + (sch ? `\n班表：${sch.shiftStart}~${sch.shiftEnd}` : "")
-        );
-      }
-
-      const d = doc.data();
       const lines = [];
       lines.push(`📋 ${empNo} ${dateStr}`);
-      if (sch) lines.push(`班表：${sch.shiftStart}~${sch.shiftEnd}`);
-      lines.push(`上班：${d.checkIn ? formatTs(d.checkIn) : "—"}`);
-      lines.push(`下班：${d.checkOut ? formatTs(d.checkOut) : "—"}`);
-      if (d.adminDecision) {
-        const ad = d.adminDecision;
-        lines.push(`老闆判定：${ad.status || "—"}`);
-        if (ad.note) lines.push(`備註：${ad.note}`);
+
+      if (sch?.shifts?.morning?.enabled !== false && sch?.shifts?.morning) {
+        lines.push(`早班：${sch.shifts.morning.start}~${sch.shifts.morning.end}`);
+      } else if (sch?.shifts?.morning?.enabled === false) {
+        lines.push("早班：關閉");
       }
-      if (d.adminEdits && Array.isArray(d.adminEdits) && d.adminEdits.length) {
-        lines.push(`補打卡紀錄：${d.adminEdits.length} 筆`);
+
+      if (sch?.shifts?.evening?.enabled !== false && sch?.shifts?.evening) {
+        lines.push(`晚班：${sch.shifts.evening.start}~${sch.shifts.evening.end}`);
+      } else if (sch?.shifts?.evening?.enabled === false) {
+        lines.push("晚班：關閉");
+      }
+
+      if (!attDoc.exists) {
+        lines.push("尚無打卡紀錄");
+        return replyText(event.replyToken, lines.join("\n"));
+      }
+
+      const d = attDoc.data();
+      const m = d.records?.morning || {};
+      const e = d.records?.evening || {};
+
+      lines.push("---");
+      lines.push(`早班上班：${m.checkIn ? formatTs(m.checkIn) : "—"}（遲到 ${m.lateMinutes || 0} 分）`);
+      lines.push(`早班下班：${m.checkOut ? formatTs(m.checkOut) : "—"}（加班 ${m.overtimeMinutes || 0} / 早退 ${m.earlyLeaveMinutes || 0}）`);
+      lines.push(`晚上上班：${e.checkIn ? formatTs(e.checkIn) : "—"}（遲到 ${e.lateMinutes || 0} 分）`);
+      lines.push(`晚上下班：${e.checkOut ? formatTs(e.checkOut) : "—"}（加班 ${e.overtimeMinutes || 0} / 早退 ${e.earlyLeaveMinutes || 0}）`);
+
+      if (d.adminDecision?.status === "normal") {
+        lines.push("---");
+        lines.push("老闆判定：✅ 視為正常");
+        if (d.adminDecision.note) lines.push(`備註：${d.adminDecision.note}`);
       }
 
       return replyText(event.replyToken, lines.join("\n"));
@@ -294,47 +520,51 @@ async function handleEvent(event) {
         .where("date", "<=", endDate)
         .get();
 
-      let worked = 0;
-      let missingCheckIn = 0;
-      let missingCheckOut = 0;
-      let adminNormal = 0;
+      let days = 0;
+      let lateTotal = 0;
+      let otTotal = 0;
+      let elTotal = 0;
 
       snaps.forEach((doc) => {
+        days++;
         const d = doc.data();
-        const hasIn = !!d.checkIn;
-        const hasOut = !!d.checkOut;
-        if (hasIn || hasOut) worked++;
-        if (!hasIn) missingCheckIn++;
-        if (!hasOut) missingCheckOut++;
-        if (d.adminDecision && d.adminDecision.status === "normal") adminNormal++;
+        const m = d.records?.morning || {};
+        const e = d.records?.evening || {};
+
+        lateTotal += (m.lateMinutes || 0) + (e.lateMinutes || 0);
+        otTotal += (m.overtimeMinutes || 0) + (e.overtimeMinutes || 0);
+        elTotal += (m.earlyLeaveMinutes || 0) + (e.earlyLeaveMinutes || 0);
       });
 
       return replyText(
         event.replyToken,
         [
           `📅 ${empNo} ${monthStr} 月報`,
-          `有紀錄天數：${worked}`,
-          `缺上班卡天數：${missingCheckIn}`,
-          `缺下班卡天數：${missingCheckOut}`,
-          `老闆視為正常天數：${adminNormal}`,
-          "（加班/早退統計：下一步會接排班規則做『純顯示』）",
+          `有資料天數：${days}`,
+          `遲到總分鐘：${lateTotal}（會影響薪資：Step 3）`,
+          `加班總分鐘：${otTotal}（純顯示）`,
+          `早退總分鐘：${elTotal}（純顯示）`,
         ].join("\n")
       );
     }
 
-    // 補上班/補下班 <編號> <YYYY-MM-DD> <HH:MM> [備註...]
-    if (cmd === "補上班" || cmd === "補下班") {
-      const type = cmd === "補上班" ? "checkIn" : "checkOut";
+    // 補早上班/補早下班/補晚上班/補晚下班 <編號> <YYYY-MM-DD> <HH:MM> [備註...]
+    const adminPunchMap = {
+      補早上班: { shiftKey: "morning", action: "checkIn" },
+      補早下班: { shiftKey: "morning", action: "checkOut" },
+      補晚上班: { shiftKey: "evening", action: "checkIn" },
+      補晚下班: { shiftKey: "evening", action: "checkOut" },
+    };
+
+    if (adminPunchMap[cmd]) {
+      const { shiftKey, action } = adminPunchMap[cmd];
       const empNo = (args[0] || "").toUpperCase();
       const dateStr = args[1] || "";
       const timeStr = args[2] || "";
       const note = args.slice(3).join(" ").trim() || "";
 
       if (!empNo || !dateStr || !timeStr) {
-        return replyText(
-          event.replyToken,
-          `格式：${cmd} A001 2025-12-12 14:32 備註`
-        );
+        return replyText(event.replyToken, `格式：${cmd} A001 2025-12-12 10:03 備註`);
       }
       if (!isValidDate(dateStr)) return replyText(event.replyToken, "日期格式錯誤，需 YYYY-MM-DD");
       if (!isValidTime(timeStr)) return replyText(event.replyToken, "時間格式錯誤，需 HH:MM");
@@ -342,38 +572,21 @@ async function handleEvent(event) {
       const emp = await getEmployeeByEmpNo(empNo);
       if (!emp) return replyText(event.replyToken, `找不到員工：${empNo}`);
 
-      const [hh, mm] = timeStr.split(":").map((x) => Number(x));
-      const dt = new Date(dateStr);
-      dt.setHours(hh, mm, 0, 0);
+      const at = toDateAt(dateStr, timeStr);
 
-      const docId = attendanceDocId(empNo, dateStr);
-      const ref = db.collection("attendance").doc(docId);
-      const snap = await ref.get();
-      const before = snap.exists ? snap.data()[type] : null;
+      const r = await applyPunch({
+        empNo,
+        userId: emp.userId || null,
+        dateStr,
+        shiftKey,
+        action,
+        at,
+        byAdmin: true,
+        note,
+        adminEmpNo: employee.empNo,
+      });
 
-      await ref.set(
-        {
-          empNo,
-          userId: emp.userId || null,
-          date: dateStr,
-          [type]: dt,
-          adminEdits: admin.firestore.FieldValue.arrayUnion({
-            type,
-            setTo: dt.toISOString(),
-            before: before ? safeToISO(before) : null,
-            note,
-            adminEmpNo: employee.empNo,
-            at: new Date().toISOString(),
-          }),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      return replyText(
-        event.replyToken,
-        `✅ 已${cmd}：${empNo} ${dateStr} ${timeStr}${note ? "\n備註：" + note : ""}`
-      );
+      return replyText(event.replyToken, r.ok ? `✅ ${cmd} 完成\n${r.msg}` : `❌ ${r.msg}`);
     }
 
     // 視為正常 <編號> <YYYY-MM-DD> [備註...]
@@ -382,13 +595,10 @@ async function handleEvent(event) {
       const dateStr = args[1] || "";
       const note = args.slice(2).join(" ").trim() || "";
 
-      if (!empNo || !dateStr) {
-        return replyText(event.replyToken, "格式：視為正常 A001 2025-12-12 備註");
-      }
+      if (!empNo || !dateStr) return replyText(event.replyToken, "格式：視為正常 A001 2025-12-12 備註");
       if (!isValidDate(dateStr)) return replyText(event.replyToken, "日期格式錯誤，需 YYYY-MM-DD");
 
-      const docId = attendanceDocId(empNo, dateStr);
-      await db.collection("attendance").doc(docId).set(
+      await db.collection("attendance").doc(attendanceDocId(empNo, dateStr)).set(
         {
           empNo,
           date: dateStr,
@@ -403,108 +613,83 @@ async function handleEvent(event) {
         { merge: true }
       );
 
-      return replyText(
-        event.replyToken,
-        `✅ 已標記視為正常：${empNo} ${dateStr}${note ? "\n備註：" + note : ""}`
-      );
+      return replyText(event.replyToken, `✅ 已標記視為正常：${empNo} ${dateStr}${note ? "\n備註：" + note : ""}`);
     }
 
-    // 老闆沒匹配到指令
-    //（不回覆也行，但我保留一個提示）
     return replyText(event.replyToken, "指令不完整或未知。輸入：老闆  查看指令表");
   }
 
-  // ------------------- 員工模式指令 -------------------
-  // 上班/下班：只記錄實際時間，補打卡不在員工端做
-  if (cmd === "上班") {
-    const docId = attendanceDocId(employee.empNo, today);
-    const ref = db.collection("attendance").doc(docId);
-    const snap = await ref.get();
+  // ------------------- 員工模式（先用文字，之後改按鍵） -------------------
+  // 點錯班別怎麼辦：一律先進 pending，回「確認/取消」才寫入
+  const staffPunchMap = {
+    早班上班: { shiftKey: "morning", action: "checkIn" },
+    早班下班: { shiftKey: "morning", action: "checkOut" },
+    晚班上班: { shiftKey: "evening", action: "checkIn" },
+    晚班下班: { shiftKey: "evening", action: "checkOut" },
+  };
 
-    if (snap.exists && snap.data().checkIn) {
-      return replyText(event.replyToken, "⚠️ 今天已經上班打卡過了");
-    }
+  if (staffPunchMap[cmd]) {
+    const { shiftKey, action } = staffPunchMap[cmd];
+    await setPending(userId, {
+      empNo: employee.empNo,
+      dateStr: today,
+      shiftKey,
+      action,
+    });
 
-    // 同步帶入排班（純存，不做薪資）
-    const sch = await getSchedule(employee.empNo, today);
-
-    await ref.set(
-      {
-        empNo: employee.empNo,
-        userId,
-        date: today,
-        checkIn: new Date(),
-        shiftStart: sch?.shiftStart || null,
-        shiftEnd: sch?.shiftEnd || null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
+    return replyText(
+      event.replyToken,
+      `⚠️ 請確認：你要打【${shiftLabel(shiftKey)}】的【${action === "checkIn" ? "上班" : "下班"}】嗎？\n回覆：確認 / 取消`
     );
-
-    return replyText(event.replyToken, `🟢 上班打卡成功（${employee.empNo}）`);
   }
 
-  if (cmd === "下班") {
-    const docId = attendanceDocId(employee.empNo, today);
-    const ref = db.collection("attendance").doc(docId);
-    const snap = await ref.get();
-
-    if (!snap.exists || !snap.data().checkIn) {
-      return replyText(event.replyToken, "❌ 你今天尚未上班打卡，無法下班");
-    }
-    if (snap.data().checkOut) {
-      return replyText(event.replyToken, "⚠️ 今天已經下班打卡過了");
-    }
-
-    await ref.set(
-      {
-        checkOut: new Date(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return replyText(event.replyToken, `🔴 下班打卡成功（${employee.empNo}）`);
-  }
-
-  // 今日：看自己今天狀態
+  // 今日（顯示早/晚兩班）
   if (cmd === "今日") {
-    const docId = attendanceDocId(employee.empNo, today);
-    const doc = await db.collection("attendance").doc(docId).get();
+    const attDoc = await db.collection("attendance").doc(attendanceDocId(employee.empNo, today)).get();
     const sch = await getSchedule(employee.empNo, today);
 
-    if (!doc.exists) {
-      return replyText(
-        event.replyToken,
-        `📋 今日（${today}）\n尚無打卡紀錄` + (sch ? `\n班表：${sch.shiftStart}~${sch.shiftEnd}` : "")
-      );
-    }
-
-    const d = doc.data();
     const lines = [];
     lines.push(`📋 今日（${today}）`);
-    if (sch) lines.push(`班表：${sch.shiftStart}~${sch.shiftEnd}`);
-    lines.push(`上班：${d.checkIn ? formatTs(d.checkIn) : "—"}`);
-    lines.push(`下班：${d.checkOut ? formatTs(d.checkOut) : "—"}`);
 
-    if (d.adminDecision?.status === "normal") {
-      lines.push("老闆判定：✅ 視為正常");
+    if (sch?.shifts?.morning?.enabled !== false && sch?.shifts?.morning) {
+      lines.push(`早班：${sch.shifts.morning.start}~${sch.shifts.morning.end}`);
+    } else if (sch?.shifts?.morning?.enabled === false) {
+      lines.push("早班：關閉");
     }
 
-    // 加班/早退（純顯示）下一步你要我再接計算；這裡先保留欄位展示
-    if (typeof d.overtimeMinutes === "number" || typeof d.earlyLeaveMinutes === "number") {
-      lines.push(`加班：${d.overtimeMinutes || 0} 分鐘`);
-      lines.push(`早退：${d.earlyLeaveMinutes || 0} 分鐘`);
-    } else {
-      lines.push("加班/早退：尚未計算（下一步接排班規則）");
+    if (sch?.shifts?.evening?.enabled !== false && sch?.shifts?.evening) {
+      lines.push(`晚班：${sch.shifts.evening.start}~${sch.shifts.evening.end}`);
+    } else if (sch?.shifts?.evening?.enabled === false) {
+      lines.push("晚班：關閉");
+    }
+
+    if (!attDoc.exists) {
+      lines.push("尚無打卡紀錄");
+      lines.push("打卡指令：早班上班 / 早班下班 / 晚班上班 / 晚班下班");
+      return replyText(event.replyToken, lines.join("\n"));
+    }
+
+    const d = attDoc.data();
+    const m = d.records?.morning || {};
+    const e = d.records?.evening || {};
+
+    lines.push("---");
+    lines.push(`早班上班：${m.checkIn ? formatTs(m.checkIn) : "—"}（遲到 ${m.lateMinutes || 0} 分）`);
+    lines.push(`早班下班：${m.checkOut ? formatTs(m.checkOut) : "—"}（加班 ${m.overtimeMinutes || 0} / 早退 ${m.earlyLeaveMinutes || 0}）`);
+    lines.push(`晚上上班：${e.checkIn ? formatTs(e.checkIn) : "—"}（遲到 ${e.lateMinutes || 0} 分）`);
+    lines.push(`晚上下班：${e.checkOut ? formatTs(e.checkOut) : "—"}（加班 ${e.overtimeMinutes || 0} / 早退 ${e.earlyLeaveMinutes || 0}）`);
+
+    if (d.adminDecision?.status === "normal") {
+      lines.push("---");
+      lines.push("老闆判定：✅ 視為正常");
     }
 
     return replyText(event.replyToken, lines.join("\n"));
   }
 
-  // 本月：先給簡易統計（詳細下一步接排班計算）
+  // 本月（先統計遲到/加班/早退總分鐘）
   if (cmd === "本月") {
-    const monthStr = today.slice(0, 7); // YYYY-MM
+    const monthStr = today.slice(0, 7);
     const startDate = `${monthStr}-01`;
     const endDate = `${monthStr}-31`;
 
@@ -516,66 +701,45 @@ async function handleEvent(event) {
       .get();
 
     let days = 0;
-    let missingIn = 0;
-    let missingOut = 0;
+    let lateTotal = 0;
+    let otTotal = 0;
+    let elTotal = 0;
 
     snaps.forEach((doc) => {
-      const d = doc.data();
       days++;
-      if (!d.checkIn) missingIn++;
-      if (!d.checkOut) missingOut++;
+      const d = doc.data();
+      const m = d.records?.morning || {};
+      const e = d.records?.evening || {};
+      lateTotal += (m.lateMinutes || 0) + (e.lateMinutes || 0);
+      otTotal += (m.overtimeMinutes || 0) + (e.overtimeMinutes || 0);
+      elTotal += (m.earlyLeaveMinutes || 0) + (e.earlyLeaveMinutes || 0);
     });
 
     return replyText(
       event.replyToken,
       [
-        `📅 本月出勤（${monthStr}）`,
-        `有紀錄天數：${days}`,
-        `缺上班卡天數：${missingIn}`,
-        `缺下班卡天數：${missingOut}`,
-        "加班/早退總計：下一步接排班計算（純顯示、不影響薪資）",
+        `📅 本月（${monthStr}）`,
+        `有資料天數：${days}`,
+        `遲到總分鐘：${lateTotal}（會影響薪資：Step 3）`,
+        `加班總分鐘：${otTotal}（純顯示）`,
+        `早退總分鐘：${elTotal}（純顯示）`,
       ].join("\n")
     );
   }
 
-  // 指令說明
+  // 說明
   return replyText(
     event.replyToken,
     [
-      "可用指令：",
-      "👉 上班",
-      "👉 下班",
+      "可用指令（之後改按鍵）：",
+      "👉 早班上班 / 早班下班",
+      "👉 晚班上班 / 晚班下班",
       "👉 今日",
       "👉 本月",
-      isAdmin ? "👉 老闆（查看老闆指令）" : "",
+      isAdmin ? "👉 老闆" : "",
+      "（防呆：打卡會先要求『確認/取消』）",
     ].filter(Boolean).join("\n")
   );
-}
-
-// ------------------- Timestamp 顯示工具 -------------------
-function formatTs(ts) {
-  // ts 可能是 Date / Firestore Timestamp / string
-  try {
-    if (!ts) return "—";
-    if (typeof ts === "string") return ts;
-    if (ts.toDate) return ts.toDate().toLocaleString("zh-TW");
-    if (ts instanceof Date) return ts.toLocaleString("zh-TW");
-    return String(ts);
-  } catch {
-    return String(ts);
-  }
-}
-
-function safeToISO(ts) {
-  try {
-    if (!ts) return null;
-    if (typeof ts === "string") return ts;
-    if (ts.toDate) return ts.toDate().toISOString();
-    if (ts instanceof Date) return ts.toISOString();
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 // ------------------- 啟動 Server -------------------
