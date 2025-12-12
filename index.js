@@ -82,7 +82,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 // ================= Main =================
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-
+  
+  console.log("🔥 REAL userId =", event.source.userId); 
   const userId = event.source.userId;
   const text = event.message.text.trim();
   const token = event.replyToken;
