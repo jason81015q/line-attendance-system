@@ -85,7 +85,11 @@ async function handleEvent(event) {
   
   console.log("🔥 REAL userId =", event.source.userId); 
   const userId = event.source.userId;
-  const text = event.message.text.trim();
+  const rawText = event.message.text || "";
+  const text = rawText
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // 清零寬字元
+    .replace(/\s+/g, "")                  // 清所有空白與換行
+    .normalize("NFKC");                   // 正規化字元
   const token = event.replyToken;
   const args = text.split(" ");
 
