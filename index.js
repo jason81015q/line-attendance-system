@@ -138,7 +138,7 @@ function calcOvertimeEarlyLeave(checkOut, shiftEnd, dateStr) {
 
   const end = toDateAt(dateStr, shiftEnd);
 
-  // 防跨日誤判：超過當天 23:59 以 23:59 計（避免 21:30~隔天10:00 被誤算加班）
+  // 防跨日誤判：超過當天 23:59 以 23:59 計
   const endOfDay = new Date(dateStr);
   endOfDay.setHours(23, 59, 59, 999);
 
@@ -172,8 +172,45 @@ async function getSchedule(empNo, dateStr) {
 function getShiftFromSchedule(schedule, shiftKey) {
   const s = schedule?.shifts?.[shiftKey];
   if (!s) return null;
-  if (s.enabled === false) return null; // 颱風半天：關閉某班
+  if (s.enabled === false) return null;
   return s;
+}
+
+// ------------------- 工程師模式（僅 systemAdmins 才能用） -------------------
+async function getSystemAdmin(userId) {
+  const doc = await db.collection("systemAdmins").doc(userId).get();
+  return doc.exists ? doc.data() : null;
+}
+
+async function getSession(userId) {
+  const doc = await db.collection("sessions").doc(userId).get();
+  return doc.exists ? doc.data() : null;
+}
+
+async function setSession(userId, patch) {
+  await db
+    .collection("sessions")
+    .doc(userId)
+    .set(
+      {
+        ...patch,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+}
+
+async function clearSessionImpersonation(userId) {
+  await db
+    .collection("sessions")
+    .doc(userId)
+    .set(
+      {
+        impersonateEmpNo: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 }
 
 // ------------------- Pending（防點錯：先確認再寫入） -------------------
@@ -209,11 +246,14 @@ async function applyPunch({
   userId,
   dateStr,
   shiftKey,
-  action, // checkIn / checkOut
-  at, // Date
-  byAdmin, // boolean
-  note, // string
-  adminEmpNo, // string
+  action,
+  at,
+  byAdmin,
+  note,
+  adminEmpNo,
+  actorUserId,
+  actorIsEngineer,
+  actorImpersonateEmpNo,
 }) {
   const attRef = db.collection("attendance").doc(attendanceDocId(empNo, dateStr));
   const attSnap = await attRef.get();
@@ -225,7 +265,6 @@ async function applyPunch({
   const cur = att.records?.[shiftKey] || {};
   const pathBase = `records.${shiftKey}`;
 
-  // 規則：員工下班必須先有上班（管理員補打卡可略過）
   if (action === "checkIn" && cur.checkIn) {
     return { ok: false, msg: `${shiftLabel(shiftKey)}今天已上班打卡過了` };
   }
@@ -243,34 +282,32 @@ async function applyPunch({
     userId: userId || null,
     date: dateStr,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    lastActorUserId: actorUserId || null,
+    lastActorIsEngineer: !!actorIsEngineer,
+    lastActorImpersonateEmpNo: actorImpersonateEmpNo || null,
   };
 
   updates[`${pathBase}.${action}`] = at;
 
-  // 帶入班表（若有）
   if (shift) {
     updates[`${pathBase}.shiftStart`] = shift.start || null;
     updates[`${pathBase}.shiftEnd`] = shift.end || null;
   }
 
-  // 取計算用的 start/end（優先當天班表，其次用已存在的欄位）
   const shiftStart = shift?.start || cur.shiftStart || null;
   const shiftEnd = shift?.end || cur.shiftEnd || null;
 
-  // 遲到：會影響薪資（Step 3 用），此處只記錄分鐘
   if (action === "checkIn") {
     const lateMinutes = calcLateMinutes(at, shiftStart, dateStr);
     updates[`${pathBase}.lateMinutes`] = lateMinutes;
   }
 
-  // 加班/早退：純顯示
   if (action === "checkOut") {
     const { overtimeMinutes, earlyLeaveMinutes } = calcOvertimeEarlyLeave(at, shiftEnd, dateStr);
     updates[`${pathBase}.overtimeMinutes`] = overtimeMinutes;
     updates[`${pathBase}.earlyLeaveMinutes`] = earlyLeaveMinutes;
   }
 
-  // 老闆操作紀錄（核准補打卡會走這裡，計入補打卡次數）
   if (byAdmin) {
     updates["adminEdits"] = admin.firestore.FieldValue.arrayUnion({
       source: "admin",
@@ -280,13 +317,15 @@ async function applyPunch({
       before: cur?.[action] ? safeToISO(cur[action]) : null,
       note: note || "",
       adminEmpNo: adminEmpNo || null,
+      actorUserId: actorUserId || null,
+      actorIsEngineer: !!actorIsEngineer,
+      actorImpersonateEmpNo: actorImpersonateEmpNo || null,
       at: new Date().toISOString(),
     });
   }
 
   await attRef.set(updates, { merge: true });
 
-  // 回傳資訊
   const afterSnap = await attRef.get();
   const after = afterSnap.data();
   const afterShift = after.records?.[shiftKey] || {};
@@ -324,12 +363,98 @@ async function handleEvent(event) {
   const today = getTodayDate();
   const { cmd, args } = parseCommand(userMessage);
 
-  // 先找員工
-  const employee = await getEmployeeByUserId(userId);
+  // ===== 工程師判定與 Session（僅 systemAdmins 能用） =====
+  const sysAdmin = await getSystemAdmin(userId);
+  const isEngineer = !!(sysAdmin && (sysAdmin.canImpersonate === true || sysAdmin.role === "engineer"));
 
-  // 未註冊：允許「註冊 A001」
+  // 工程師指令：不需要先綁 employees
+  if (isEngineer) {
+    if (cmd === "工程師模式") {
+      const session = await getSession(userId);
+      const acting = session?.impersonateEmpNo ? `模擬中：${session.impersonateEmpNo}` : "未模擬（工程師本體）";
+      return replyText(
+        event.replyToken,
+        [
+          "🧑‍💻 工程師模式",
+          acting,
+          "可用指令：",
+          "目前身分",
+          "模擬員工 A003",
+          "模擬老闆 A001",
+          "退出模擬",
+          "（注意：工程師本體不可打卡/不可審核，必須模擬某個員工/老闆才會進入該身分流程）",
+        ].join("\n")
+      );
+    }
+
+    if (cmd === "目前身分") {
+      const session = await getSession(userId);
+      if (!session?.impersonateEmpNo) {
+        return replyText(event.replyToken, "🧑‍💻 目前身分：工程師本體（未模擬）");
+      }
+      const emp = await getEmployeeByEmpNo(String(session.impersonateEmpNo).toUpperCase());
+      if (!emp) return replyText(event.replyToken, `⚠️ 目前模擬的員工不存在：${session.impersonateEmpNo}`);
+      return replyText(
+        event.replyToken,
+        `🧪 目前身分：模擬 ${emp.empNo}（${emp.role === "admin" ? "老闆" : "員工"}）`
+      );
+    }
+
+    if (cmd === "模擬員工") {
+      const empNo = (args[0] || "").toUpperCase();
+      if (!empNo) return replyText(event.replyToken, "格式：模擬員工 A003");
+      const emp = await getEmployeeByEmpNo(empNo);
+      if (!emp) return replyText(event.replyToken, `找不到員工：${empNo}`);
+      if (emp.role === "admin") {
+        return replyText(event.replyToken, `⚠️ ${empNo} 是老闆身分，請用：模擬老闆 ${empNo}`);
+      }
+      await setSession(userId, { impersonateEmpNo: empNo });
+      return replyText(event.replyToken, `✅ 已切換：模擬員工 ${empNo}`);
+    }
+
+    if (cmd === "模擬老闆") {
+      const empNo = (args[0] || "").toUpperCase();
+      if (!empNo) return replyText(event.replyToken, "格式：模擬老闆 A001");
+      const emp = await getEmployeeByEmpNo(empNo);
+      if (!emp) return replyText(event.replyToken, `找不到員工：${empNo}`);
+      if (emp.role !== "admin") {
+        return replyText(event.replyToken, `⚠️ ${empNo} 不是老闆身分（role!=admin），請用：模擬員工 ${empNo}`);
+      }
+      await setSession(userId, { impersonateEmpNo: empNo });
+      return replyText(event.replyToken, `✅ 已切換：模擬老闆 ${empNo}`);
+    }
+
+    if (cmd === "退出模擬") {
+      await clearSessionImpersonation(userId);
+      return replyText(event.replyToken, "✅ 已退出模擬（回到工程師本體）");
+    }
+  }
+
+  // ===== 取得「當前操作身分」 =====
+  // 一般人：employee = getEmployeeByUserId
+  // 工程師：若 session 有 impersonateEmpNo → employee = getEmployeeByEmpNo(impersonateEmpNo)
+  let employee = null;
+  let actingEmpNo = null;
+  let isImpersonated = false;
+
+  if (isEngineer) {
+    const session = await getSession(userId);
+    if (session?.impersonateEmpNo) {
+      actingEmpNo = String(session.impersonateEmpNo).toUpperCase();
+      employee = await getEmployeeByEmpNo(actingEmpNo);
+      isImpersonated = !!employee;
+    } else {
+      // 工程師本體：禁止進入任何營運流程（避免誤操作）
+      // 但允許他看「工程師模式/目前身分/模擬/退出模擬」
+      return replyText(event.replyToken, "🧑‍💻 你是工程師本體（未模擬）。\n請先輸入：工程師模式\n再用：模擬員工 A003 / 模擬老闆 A001");
+    }
+  } else {
+    employee = await getEmployeeByUserId(userId);
+  }
+
+  // 未註冊：允許「註冊 A001」（一般使用者才走）
   if (!employee) {
-    if (cmd === "註冊") {
+    if (!isEngineer && cmd === "註冊") {
       const empNo = (args[0] || "").toUpperCase();
       if (!empNo) return replyText(event.replyToken, "請輸入：註冊 A001");
 
@@ -364,19 +489,21 @@ async function handleEvent(event) {
       return replyText(event.replyToken, "✅ 已取消");
     }
 
-    // 確認：才真正打卡
     await clearPending(userId);
     const { empNo, dateStr, shiftKey, action } = pending;
     const at = new Date();
 
     const r = await applyPunch({
       empNo,
-      userId,
+      userId: employee.userId || userId, // 目標員工的 userId（模擬時仍然是測試者 userId，但 empNo 正確）
       dateStr,
       shiftKey,
       action,
       at,
       byAdmin: false,
+      actorUserId: userId,
+      actorIsEngineer: isEngineer,
+      actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
     });
 
     return replyText(event.replyToken, r.msg);
@@ -385,10 +512,11 @@ async function handleEvent(event) {
   // ------------------- 老闆模式 -------------------
   if (isAdmin) {
     if (cmd === "老闆" || cmd === "admin") {
+      const head = isEngineer && isImpersonated ? `🧪（工程師模擬：${employee.empNo}）` : "";
       return replyText(
         event.replyToken,
         [
-          "👑 老闆模式（文字測試用，之後可改按鍵）",
+          `👑 老闆模式 ${head}`.trim(),
           "新增員工 A002 小明",
           "設定早班 A001 2025-12-12 10:00 14:30",
           "設定晚班 A001 2025-12-12 17:00 21:30",
@@ -532,7 +660,7 @@ async function handleEvent(event) {
       return replyText(event.replyToken, lines.join("\n"));
     }
 
-    // 查月報（遲到/加班/早退統計）
+    // 查月報
     if (cmd === "查月報") {
       const empNo = (args[0] || "").toUpperCase();
       const monthStr = args[1] || "";
@@ -572,7 +700,7 @@ async function handleEvent(event) {
         [
           `📅 ${empNo} ${monthStr} 月報`,
           `有資料天數：${days}`,
-          `遲到總分鐘：${lateTotal}（會影響薪資：Step 3）`,
+          `遲到總分鐘：${lateTotal}（影響薪資）`,
           `加班總分鐘：${otTotal}（純顯示）`,
           `早退總分鐘：${elTotal}（純顯示）`,
           `補打卡次數：${makeupCount}（超過 3 次全勤破功）`,
@@ -616,12 +744,15 @@ async function handleEvent(event) {
         byAdmin: true,
         note: note || "老闆補打卡",
         adminEmpNo: employee.empNo,
+        actorUserId: userId,
+        actorIsEngineer: isEngineer,
+        actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
       });
 
       return replyText(event.replyToken, r.ok ? `✅ ${cmd} 完成\n${r.msg}` : `❌ ${r.msg}`);
     }
 
-    // 視為正常（不會清掉遲到/補打卡次數，只是判定當日）
+    // 視為正常
     if (cmd === "視為正常") {
       const empNo = (args[0] || "").toUpperCase();
       const dateStr = args[1] || "";
@@ -638,6 +769,9 @@ async function handleEvent(event) {
             status: "normal",
             note,
             adminEmpNo: employee.empNo,
+            adminUserId: userId,
+            actorIsEngineer: !!isEngineer,
+            actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
             at: new Date().toISOString(),
           },
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -648,14 +782,10 @@ async function handleEvent(event) {
       return replyText(event.replyToken, `✅ 已標記視為正常：${empNo} ${dateStr}${note ? "\n備註：" + note : ""}`);
     }
 
-    // ------------------- 補打卡申請審核（列表/核准/駁回） -------------------
+    // 補打卡申請審核
     if (cmd === "補打卡列表") {
-      // 為避免 Firestore 需要複合索引：不 orderBy，抓 pending 後在記憶體排序
       const snap = await db.collection("makeupRequests").where("status", "==", "pending").get();
-
-      if (snap.empty) {
-        return replyText(event.replyToken, "目前沒有待審核的補打卡申請");
-      }
+      if (snap.empty) return replyText(event.replyToken, "目前沒有待審核的補打卡申請");
 
       const items = snap.docs.map((doc) => {
         const d = doc.data();
@@ -665,7 +795,6 @@ async function handleEvent(event) {
           createdAtMs: d.createdAt?.toDate ? d.createdAt.toDate().getTime() : 0,
         };
       });
-
       items.sort((a, b) => a.createdAtMs - b.createdAtMs);
 
       const lines = ["📋 待審核補打卡："];
@@ -694,7 +823,6 @@ async function handleEvent(event) {
       const req = snap.data();
       if (req.status !== "pending") return replyText(event.replyToken, "此申請已處理過");
 
-      // 核准：寫入 attendance（走 applyPunch → 記 adminEdits → 計入補打卡次數）
       const at = new Date();
       const r = await applyPunch({
         empNo: req.empNo,
@@ -706,18 +834,21 @@ async function handleEvent(event) {
         byAdmin: true,
         note: `核准補打卡申請(${requestId})：${req.reason}`,
         adminEmpNo: employee.empNo,
+        actorUserId: userId,
+        actorIsEngineer: isEngineer,
+        actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
       });
 
-      if (!r.ok) {
-        // 不把申請改狀態，讓你能再處理
-        return replyText(event.replyToken, `❌ 核准失敗：${r.msg}`);
-      }
+      if (!r.ok) return replyText(event.replyToken, `❌ 核准失敗：${r.msg}`);
 
       await ref.set(
         {
           status: "approved",
-          reviewedBy: employee.empNo,
+          reviewedByEmpNo: employee.empNo,
+          reviewedByUserId: userId,
           reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+          actorIsEngineer: !!isEngineer,
+          actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
         },
         { merge: true }
       );
@@ -740,9 +871,12 @@ async function handleEvent(event) {
       await ref.set(
         {
           status: "rejected",
-          reviewedBy: employee.empNo,
+          reviewedByEmpNo: employee.empNo,
+          reviewedByUserId: userId,
           reviewNote: note,
           reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+          actorIsEngineer: !!isEngineer,
+          actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
         },
         { merge: true }
       );
@@ -767,11 +901,14 @@ async function handleEvent(event) {
 
     const requestId = await createMakeupRequest({
       empNo: employee.empNo,
-      userId,
+      userId: employee.userId || userId,
       date: today,
       shiftKey,
       action,
       reason,
+      submittedByUserId: userId,
+      actorIsEngineer: !!isEngineer,
+      actorImpersonateEmpNo: isEngineer ? actingEmpNo : null,
     });
 
     return replyText(event.replyToken, `✅ 已送出補打卡申請\n編號：${requestId}\n等待老闆確認`);
@@ -806,7 +943,7 @@ async function handleEvent(event) {
     const sch = await getSchedule(employee.empNo, today);
 
     const lines = [];
-    lines.push(`📋 今日（${today}）`);
+    lines.push(`📋 今日（${today}）${isEngineer && isImpersonated ? `（模擬：${employee.empNo}）` : ""}`);
 
     const mSch = sch?.shifts?.morning;
     const eSch = sch?.shifts?.evening;
@@ -875,7 +1012,7 @@ async function handleEvent(event) {
     return replyText(
       event.replyToken,
       [
-        `📅 本月（${monthStr}）`,
+        `📅 本月（${monthStr}）${isEngineer && isImpersonated ? `（模擬：${employee.empNo}）` : ""}`,
         `有資料天數：${days}`,
         `遲到總分鐘：${lateTotal}（影響薪資）`,
         `加班總分鐘：${otTotal}（純顯示）`,
@@ -885,7 +1022,6 @@ async function handleEvent(event) {
     );
   }
 
-  // 說明
   return replyText(
     event.replyToken,
     [
@@ -897,6 +1033,7 @@ async function handleEvent(event) {
       "👉 申請補打卡 早班 上班 原因",
       "（打卡會先要求：確認 / 取消）",
       isAdmin ? "👉 老闆" : "",
+      isEngineer ? "👉 工程師模式 / 目前身分 / 退出模擬" : "",
     ]
       .filter(Boolean)
       .join("\n")
