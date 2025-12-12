@@ -95,7 +95,7 @@ async function handleEvent(event) {
   const engineer = await isEngineer(userId);
   if (engineer) {
     // 工程師指令「只要命中就 return」，不往下跑
-    if (text === "工程師模式") {
+    if (text.replace(/\s/g, "") === "工程師模式") {
       const s = await getSession(userId);
       return reply(
         token,
@@ -114,7 +114,7 @@ async function handleEvent(event) {
       );
     }
 
-    if (text === "目前身分") {
+    if (text.replace(/\s/g, "") === "目前身分") {
       const s = await getSession(userId);
       if (!s.impersonateEmpNo) {
         return reply(token, "🧑‍💻 目前身分：工程師本體");
@@ -126,7 +126,7 @@ async function handleEvent(event) {
       );
     }
 
-    if (args[0] === "模擬員工") {
+    if (text.replace(/\s/g, "").startsWith("模擬員工")) {
       const empNo = args[1];
       const emp = await getEmployeeByEmpNo(empNo);
       if (!emp || emp.role !== "staff") {
@@ -136,7 +136,7 @@ async function handleEvent(event) {
       return reply(token, `✅ 已模擬員工 ${empNo}`);
     }
 
-    if (args[0] === "模擬老闆") {
+    if (text.replace(/\s/g, "").startsWith("模擬老闆")) {
       const empNo = args[1];
       const emp = await getEmployeeByEmpNo(empNo);
       if (!emp || emp.role !== "admin") {
@@ -146,7 +146,7 @@ async function handleEvent(event) {
       return reply(token, `✅ 已模擬老闆 ${empNo}`);
     }
 
-    if (text === "退出模擬") {
+    if (text.replace(/\s/g, "") === "退出模擬") {
       await clearSession(userId);
       return reply(token, "✅ 已退出模擬，回到工程師本體");
     }
