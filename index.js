@@ -48,34 +48,12 @@ async function handleEvent(event) {
     return reply(event, "❌ 尚未綁定員工資料");
   }
 
-  /* ===== staff：打卡 ===== */
-  if (text === "上班" || text === "下班") {
-    return reply(
-      event,
-      "請選擇班別：\n👉 早班\n👉 晚班"
-    );
+  /* ===== 設定供餐（admin only）===== */
+  if (text.startsWith("設定供餐")) {
+    return handleCompanyMealSetting(event, emp, text);
   }
 
-  if (text === "早班" || text === "晚班") {
-    return reply(
-      event,
-      "請選擇動作：\n👉 上班\n👉 下班"
-    );
-  }
-
-  if (
-    ["早班上班", "早班下班", "晚班上班", "晚班下班"].includes(text)
-  ) {
-    return handleAttendance(event, emp, text);
-  }
-
-  /* ===== staff：補打卡申請 ===== */
-  if (text.startsWith("補打卡")) {
-    // 格式：補打卡 2025-12-10 早班 上班 原因
-    return handleMakeupRequest(event, emp, text);
-  }
-
-  /* ===== approver：核准 / 拒絕 ===== */
+  /* ===== 補打卡核准 / 拒絕 ===== */
   if (text.startsWith("MAKEUP|")) {
     return handleMakeupDecision(event, text);
   }
@@ -83,7 +61,7 @@ async function handleEvent(event) {
   return reply(event, "❓ 指令不正確");
 }
 
-/* ================== 工具函式 ================== */
+/* ================== 工具 ================== */
 
 async function getEmployeeByUserId(userId) {
   const snap = await db
@@ -102,108 +80,54 @@ function reply(event, text) {
   });
 }
 
-/* ================== 打卡 ================== */
+/* ================== 設定供餐（防重複） ================== */
 
-async function handleAttendance(event, emp, text) {
-  const [shiftText, actionText] = text.split("");
-  const shiftKey = shiftText === "早" ? "morning" : "night";
-  const actionKey = actionText === "上" ? "checkIn" : "checkOut";
-
-  const today = new Date().toISOString().slice(0, 10);
-  const docId = `${emp.empKey}_${today}`;
-
-  const ref = db.collection("attendance").doc(docId);
-  const snap = await ref.get();
-
-  const data = snap.exists
-    ? snap.data()
-    : {
-        empKey: emp.empKey,
-        date: today,
-        shift: {
-          morning: { checkIn: null, checkOut: null },
-          night: { checkIn: null, checkOut: null },
-        },
-      };
-
-  if (data.shift[shiftKey][actionKey]) {
-    return reply(event, "⚠️ 此打卡已存在");
+async function handleCompanyMealSetting(event, emp, text) {
+  if (!emp.canApprove) {
+    return reply(event, "❌ 你沒有權限");
   }
 
-  data.shift[shiftKey][actionKey] =
-    admin.firestore.FieldValue.serverTimestamp();
-
-  await ref.set(data, { merge: true });
-  return reply(event, "✅ 打卡成功");
-}
-
-/* ================== 補打卡申請 ================== */
-
-async function handleMakeupRequest(event, emp, text) {
+  // 指令格式：設定供餐 2025-12-10 早班
   const parts = text.split(" ");
-  if (parts.length < 5) {
+  if (parts.length !== 3) {
+    return reply(event, "❌ 格式錯誤\n設定供餐 YYYY-MM-DD 早班/晚班");
+  }
+
+  const [, date, shiftText] = parts;
+  const shift =
+    shiftText === "早班"
+      ? "morning"
+      : shiftText === "晚班"
+      ? "night"
+      : null;
+
+  if (!shift) {
+    return reply(event, "❌ 班別必須是 早班 或 晚班");
+  }
+
+  const docId = `company_meal_${date}_${shift}`;
+  const ref = db.collection("workExceptions").doc(docId);
+
+  const snap = await ref.get();
+  if (snap.exists) {
     return reply(
       event,
-      "❌ 格式錯誤\n補打卡 YYYY-MM-DD 早班/晚班 上班/下班 原因"
+      `⚠️ ${date} ${shiftText} 已設定供餐（不會重複建立）`
     );
   }
 
-  const [, date, shiftText, actionText, ...reasonArr] = parts;
-  const shiftKey = shiftText === "早班" ? "morning" : "night";
-  const actionKey = actionText === "上班" ? "checkIn" : "checkOut";
-
-  const reason = reasonArr.join(" ");
-
-  const reqRef = await db.collection("makeupRequests").add({
-    empKey: emp.empKey,
-    requesterUserId: emp.userId,
+  await ref.set({
+    type: "company_meal",
     date,
-    shiftKey,
-    actionKey,
-    reason,
-    status: "pending",
+    shift,
+    createdBy: emp.empKey,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  await notifyApprovers(reqRef.id, emp, date, shiftText, actionText, reason);
-  return reply(event, "📨 已送出補打卡申請");
+  return reply(event, `✅ 已設定 ${date} ${shiftText} 供餐（不給餐補）`);
 }
 
-/* ================== 推播給核准者 ================== */
-
-async function notifyApprovers(
-  requestId,
-  emp,
-  date,
-  shiftText,
-  actionText,
-  reason
-) {
-  const snap = await db
-    .collection("employees")
-    .where("canApprove", "==", true)
-    .get();
-
-  const message = {
-    type: "text",
-    text:
-      `📌 補打卡申請\n` +
-      `員工：${emp.displayName}\n` +
-      `日期：${date}\n` +
-      `班別：${shiftText}\n` +
-      `動作：${actionText}\n` +
-      `原因：${reason}\n\n` +
-      `👉 同意：MAKEUP|APPROVE|${requestId}\n` +
-      `👉 拒絕：MAKEUP|REJECT|${requestId}`,
-  };
-
-  for (const doc of snap.docs) {
-    const uid = doc.data().userId;
-    if (uid) await client.pushMessage(uid, message);
-  }
-}
-
-/* ================== 核准 / 拒絕（含防自我核准） ================== */
+/* ================== 補打卡核准（防自我核准） ================== */
 
 async function handleMakeupDecision(event, text) {
   const [, action, requestId] = text.split("|");
@@ -224,7 +148,7 @@ async function handleMakeupDecision(event, text) {
       const req = snap.data();
       if (req.status !== "pending") throw new Error("ALREADY_HANDLED");
 
-      /* 🔒 防自我核准 */
+      // 🔒 防止自己核准自己
       if (req.requesterUserId === userId) {
         throw new Error("SELF_APPROVAL");
       }
