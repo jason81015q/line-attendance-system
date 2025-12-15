@@ -3,21 +3,9 @@ const express = require("express");
 const line = require("@line/bot-sdk");
 const admin = require("firebase-admin");
 
-/* ================= 制度常數 ================= */
-const STANDARD_DAILY_MINUTES = 540; // 270+270
-const MONTHLY_DIVISOR_DAYS = 30;
-const EARLY_OT_THRESHOLD_MINUTES = 60; // ±1小時才算早退/加班（顯示用）
-
-/* ================= Feature Flags ================= */
-const FEATURES = {
-  ATTENDANCE: true,
-  MAKEUP: true,
-  SUMMARY: true,
-  PAYROLL: true,
-  SELF_REGISTER_BY_CODE: true, // 你要的：註冊 A00X 綁 userId
-};
-
-/* ================= LINE ================= */
+/* =========================
+   LINE Bot config
+========================= */
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
@@ -25,7 +13,9 @@ const config = {
 const client = new line.Client(config);
 const app = express();
 
-/* ================= Firebase ================= */
+/* =========================
+   Firebase init
+========================= */
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
@@ -35,525 +25,610 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-/* ================= Utils ================= */
-const reply = (token, msg) => client.replyMessage(token, msg);
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const monthPrefix = () => todayStr().slice(0, 7);
+/* =========================
+   Feature flags (可選)
+========================= */
+const FEATURES = {
+  ENABLE_ADVANCE: false, // 借支：你目前說 staff 只要打卡/補打卡，所以先關掉
+};
 
-function toDate(v) {
-  if (!v) return null;
-  if (typeof v.toDate === "function") return v.toDate(); // Firestore Timestamp
-  if (v instanceof Date) return v;
-  return null;
-}
+/* =========================
+   Helpers
+========================= */
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
-function parseHHMM(s) {
-  // "10:00" -> {h:10, m:0}
-  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || "").trim());
-  if (!m) return null;
-  return { h: Number(m[1]), m: Number(m[2]) };
-}
-function minutesDiff(a, b) {
-  // a - b in minutes
-  return Math.round((a.getTime() - b.getTime()) / 60000);
-}
-function atDateTime(dateStr, hhmm) {
-  const t = parseHHMM(hhmm);
-  if (!t) return null;
-  // 用當地時間（台北）概念即可；雲端是 UTC，但我們只拿差值，且同一天差值穩定
-  const d = new Date(`${dateStr}T${pad2(t.h)}:${pad2(t.m)}:00`);
-  return d;
+
+function formatYMD(d = new Date()) {
+  const dt = new Date(d);
+  return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
 }
 
-/* ================= Data Access ================= */
+function ymdToMonthKey(ymd) {
+  // "2025-12-03" -> "2025-12"
+  return ymd.slice(0, 7);
+}
+
+function attendanceDocId(empKey, ymd) {
+  return `${empKey}_${ymd}`;
+}
+
+function shiftKeyFromLabel(label) {
+  return label === "早" ? "morning" : label === "晚" ? "night" : null;
+}
+
+function actionKeyFromLabel(label) {
+  return label === "上班" ? "checkIn" : label === "下班" ? "checkOut" : null;
+}
+
+function isValidYMD(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split("-").map((x) => Number(x));
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
+
+function parseDateInputToYMD(dateText) {
+  // 支援 "YYYY-MM-DD" 或 "MM/DD"（預設今年）
+  dateText = (dateText || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateText)) return dateText;
+  const m = dateText.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m) {
+    const now = new Date();
+    const y = now.getFullYear();
+    const mm = pad2(Number(m[1]));
+    const dd = pad2(Number(m[2]));
+    return `${y}-${mm}-${dd}`;
+  }
+  return null;
+}
+
+function nowTs() {
+  return admin.firestore.Timestamp.now();
+}
+
+function quickReply(items) {
+  return {
+    items: items.map((action) => ({ type: "action", action })),
+  };
+}
+
+function postbackAction(label, data) {
+  return { type: "postback", label, data, displayText: label };
+}
+
+function messageAction(label, text) {
+  return { type: "message", label, text };
+}
+
+function flexApprovalCard({ title, fields, approveData, rejectData }) {
+  return {
+    type: "flex",
+    altText: title,
+    contents: {
+      type: "bubble",
+      size: "mega",
+      body: {
+        type: "box",
+        layout: "vertical",
+        spacing: "md",
+        contents: [
+          { type: "text", text: title, weight: "bold", size: "lg", wrap: true },
+          {
+            type: "box",
+            layout: "vertical",
+            spacing: "sm",
+            contents: fields.map((f) => ({
+              type: "box",
+              layout: "baseline",
+              contents: [
+                { type: "text", text: f.k, size: "sm", color: "#666666", flex: 3, wrap: true },
+                { type: "text", text: f.v ?? "-", size: "sm", flex: 7, wrap: true },
+              ],
+            })),
+          },
+        ],
+      },
+      footer: {
+        type: "box",
+        layout: "horizontal",
+        spacing: "sm",
+        contents: [
+          {
+            type: "button",
+            style: "primary",
+            action: { type: "postback", label: "同意", data: approveData, displayText: "同意" },
+          },
+          {
+            type: "button",
+            style: "secondary",
+            action: { type: "postback", label: "拒絕", data: rejectData, displayText: "拒絕" },
+          },
+        ],
+      },
+    },
+  };
+}
+
 async function getEmployeeByUserId(userId) {
+  const snap = await db.collection("employees").where("userId", "==", userId).limit(1).get();
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return { empKey: doc.id, ...doc.data() };
+}
+
+async function getApproverUserIds() {
+  const snap = await db.collection("employees").where("canApprove", "==", true).get();
+  const ids = [];
+  snap.forEach((d) => {
+    const data = d.data();
+    if (data.userId && typeof data.userId === "string") ids.push(data.userId);
+  });
+  return Array.from(new Set(ids));
+}
+
+async function pushToApprovers(message) {
+  const approverIds = await getApproverUserIds();
+  await Promise.all(
+    approverIds.map(async (uid) => {
+      try {
+        await client.pushMessage(uid, message);
+      } catch (e) {
+        console.error("❌ push fail", uid, e?.message || e);
+      }
+    })
+  );
+}
+
+/* =========================
+   Webhook
+========================= */
+app.post("/webhook", line.middleware(config), async (req, res) => {
+  try {
+    await Promise.all(req.body.events.map(handleEvent));
+    res.status(200).end();
+  } catch (err) {
+    console.error("❌ Webhook Error:", err);
+    res.status(500).end();
+  }
+});
+
+app.get("/", (req, res) => res.send("OK"));
+
+/* =========================
+   Event router
+========================= */
+async function handleEvent(event) {
+  if (event.type === "message" && event.message.type === "text") return onText(event);
+  if (event.type === "postback") return onPostback(event);
+  return null;
+}
+
+/* =========================
+   STAFF UI (極簡)
+   - 打卡：上班/下班 -> 早/晚
+   - 補打卡：指定日期申請制（可用 YYYY-MM-DD 或 12/10）
+========================= */
+async function replyClockMainMenu(replyToken) {
+  return client.replyMessage(replyToken, {
+    type: "text",
+    text: "請選擇打卡類型：",
+    quickReply: quickReply([
+      postbackAction("上班", "CLK_STEP1|IN"),
+      postbackAction("下班", "CLK_STEP1|OUT"),
+    ]),
+  });
+}
+
+async function replyClockShiftMenu(replyToken, inOut) {
+  const label = inOut === "IN" ? "上班" : "下班";
+  return client.replyMessage(replyToken, {
+    type: "text",
+    text: `請選擇班別（${label}）：`,
+    quickReply: quickReply([
+      postbackAction("早班", `CLK_STEP2|${inOut}|早`),
+      postbackAction("晚班", `CLK_STEP2|${inOut}|晚`),
+    ]),
+  });
+}
+
+async function writeAttendanceOnce({ empKey, ymd, shiftLabel, inOut }) {
+  const shiftKey = shiftKeyFromLabel(shiftLabel);
+  const actionKey = inOut === "IN" ? "checkIn" : "checkOut";
+  if (!shiftKey) throw new Error("BAD_SHIFT");
+
+  const ref = db.collection("attendance").doc(attendanceDocId(empKey, ymd));
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const base = snap.exists
+      ? snap.data()
+      : {
+          date: ymd,
+          empKey,
+          shift: {
+            morning: { checkIn: null, checkOut: null },
+            night: { checkIn: null, checkOut: null },
+          },
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+    // 確保結構存在
+    base.shift = base.shift || {
+      morning: { checkIn: null, checkOut: null },
+      night: { checkIn: null, checkOut: null },
+    };
+    base.shift[shiftKey] = base.shift[shiftKey] || { checkIn: null, checkOut: null };
+
+    if (base.shift[shiftKey][actionKey]) {
+      throw new Error("ALREADY");
+    }
+
+    base.shift[shiftKey][actionKey] = nowTs();
+    base.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    tx.set(ref, base, { merge: true });
+  });
+}
+
+/* =========================
+   補打卡（申請制）
+   格式：補打卡 YYYY-MM-DD 早|晚 上班|下班 原因
+         補打卡 12/10 早 上班 忘記打卡
+========================= */
+async function parseMakeupText(text) {
+  // 補打卡 <date> <早|晚> <上班|下班> <reason...>
+  const m = text.match(/^補打卡\s+(\S+)\s+(早|晚)\s+(上班|下班)\s+(.+)$/);
+  if (!m) return null;
+
+  const rawDate = m[1];
+  const shiftLabel = m[2];
+  const actLabel = m[3];
+  const reason = m[4].trim();
+
+  const ymd = parseDateInputToYMD(rawDate);
+  if (!ymd || !isValidYMD(ymd)) return { error: "BAD_DATE" };
+
+  const shiftKey = shiftKeyFromLabel(shiftLabel);
+  const actionKey = actionKeyFromLabel(actLabel);
+  if (!shiftKey || !actionKey) return { error: "BAD_SLOT" };
+
+  // 不可未來
+  const today = formatYMD(new Date());
+  if (ymd > today) return { error: "FUTURE_DATE" };
+
+  return { ymd, shiftLabel, shiftKey, actLabel, actionKey, reason };
+}
+
+async function slotAlreadyHasRecord(empKey, ymd, shiftKey, actionKey) {
+  // 1) attendance already has record
+  const attRef = db.collection("attendance").doc(attendanceDocId(empKey, ymd));
+  const attSnap = await attRef.get();
+  const attVal = attSnap.exists ? attSnap.data()?.shift?.[shiftKey]?.[actionKey] : null;
+  if (attVal) return true;
+
+  // 2) approved makeup already exists
   const q = await db
-    .collection("employees")
-    .where("userId", "==", userId)
+    .collection("makeupRequests")
+    .where("empKey", "==", empKey)
+    .where("date", "==", ymd)
+    .where("shiftKey", "==", shiftKey)
+    .where("actionKey", "==", actionKey)
+    .where("status", "in", ["pending", "approved"])
     .limit(1)
     .get();
-  if (q.empty) return null;
-  return { empNo: q.docs[0].id, ...q.docs[0].data() };
-}
-
-async function employeeUserIdAlreadyBound(userId) {
-  const q = await db.collection("employees").where("userId", "==", userId).limit(1).get();
   return !q.empty;
 }
 
-async function getEmployeeByEmpNo(empNo) {
-  const ref = db.collection("employees").doc(empNo);
-  const snap = await ref.get();
-  if (!snap.exists) return null;
-  return { empNo, ...snap.data(), _ref: ref };
+async function createMakeupRequestAndNotify({ emp, ymd, shiftLabel, shiftKey, actLabel, actionKey, reason }) {
+  // 防呆：已有紀錄就不建立申請
+  const exists = await slotAlreadyHasRecord(emp.empKey, ymd, shiftKey, actionKey);
+  if (exists) {
+    return {
+      type: "text",
+      text: `⚠️ ${ymd} ${shiftLabel}班 ${actLabel} 已有紀錄或已有申請中/已核准\n不需要再補打卡。`,
+    };
+  }
+
+  const reqRef = await db.collection("makeupRequests").add({
+    empKey: emp.empKey,
+    requesterUserId: emp.userId,
+    date: ymd,
+    shiftLabel,
+    shiftKey,
+    actLabel,
+    actionKey,
+    reason,
+    status: "pending",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // 推播給所有 canApprove（你之前反映沒收到，這裡是主動 push）
+  const card = flexApprovalCard({
+    title: "📝 補打卡申請",
+    fields: [
+      { k: "員工", v: emp.empKey },
+      { k: "日期", v: ymd },
+      { k: "項目", v: `${shiftLabel}班 ${actLabel}` },
+      { k: "原因", v: reason },
+      { k: "申請ID", v: reqRef.id },
+    ],
+    approveData: `MKP_DECIDE|APPROVE|${reqRef.id}`,
+    rejectData: `MKP_DECIDE|REJECT|${reqRef.id}`,
+  });
+  await pushToApprovers(card);
+
+  return { type: "text", text: `✅ 已送出補打卡申請（${reqRef.id}）\n等待核准者處理。` };
 }
 
-async function ensureAttendance(empNo, date) {
-  const ref = db.collection("attendance").doc(`${empNo}_${date}`);
+/* =========================
+   管理層：制度性例外（不做 UI）
+   指令：
+   - 設定颱風 YYYY-MM-DD 半天|全天
+   - 設定店休 YYYY-MM-DD 半天|全天
+========================= */
+async function handleWorkExceptionCommand(emp, text) {
+  // 權限：只有 canApprove 才能設
+  if (!emp?.canApprove) return null;
+
+  const m = text.match(/^(設定颱風|設定店休)\s+(\S+)\s+(半天|全天)$/);
+  if (!m) return null;
+
+  const kind = m[1] === "設定颱風" ? "typhoon" : "store-close";
+  const rawDate = m[2];
+  const unit = m[3];
+
+  const ymd = parseDateInputToYMD(rawDate);
+  if (!ymd || !isValidYMD(ymd)) {
+    return { type: "text", text: "❌ 日期格式錯誤，請用：設定颱風 2025-12-03 半天" };
+  }
+
+  const paidMinutes = unit === "半天" ? 270 : 540; // 你固定 540 分鐘/日
+  const monthKey = ymdToMonthKey(ymd);
+
+  const ref = db.collection("workExceptions").doc(monthKey);
+  const fieldPath = ymd; // 用日期做欄位 key
   await ref.set(
     {
-      empNo,
-      date,
-      shift: {
-        morning: { checkIn: null, checkOut: null },
-        night: { checkIn: null, checkOut: null },
-      },
-      stats: {
-        lateMinutes: 0,
-        earlyMinutes: 0,
-        overtimeMinutes: 0,
+      [fieldPath]: {
+        type: `${kind}-${unit === "半天" ? "half" : "full"}`,
+        paidMinutes,
+        scope: "all",
+        note: kind === "typhoon" ? "颱風" : "店休",
+        setBy: emp.empKey,
+        setAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
   );
-  return ref;
+
+  return { type: "text", text: `✅ 已設定 ${ymd} 為「${m[1].replace("設定", "")}${unit}」（${paidMinutes} 分鐘）` };
 }
 
-async function punch(empNo, date, shift, type, source = "normal") {
-  const ref = await ensureAttendance(empNo, date);
-  await ref.update({
-    [`shift.${shift}.${type}`]: admin.firestore.FieldValue.serverTimestamp(),
-    source,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+/* =========================
+   Approver：核准/拒絕 補打卡
+========================= */
+async function handleMakeupDecision(event, data) {
+  const userId = event.source.userId;
+  const approver = await getEmployeeByUserId(userId);
+  if (!approver?.canApprove) {
+    return client.replyMessage(event.replyToken, { type: "text", text: "❌ 你沒有核准權限。" });
+  }
+
+  const parts = data.split("|"); // MKP_DECIDE|APPROVE|requestId
+  const action = parts[1];
+  const requestId = parts[2];
+  const reqRef = db.collection("makeupRequests").doc(requestId);
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(reqRef);
+      if (!snap.exists) throw new Error("NOT_FOUND");
+      const req = snap.data();
+      if (req.status !== "pending") throw new Error("ALREADY_DONE");
+
+      if (action === "REJECT") {
+        tx.update(reqRef, {
+          status: "rejected",
+          reviewedBy: approver.empKey,
+          reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
+      // APPROVE：不回寫「真實打卡時間」，但可在 attendance 對應格做標記（不破壞架構）
+      const attRef = db.collection("attendance").doc(attendanceDocId(req.empKey, req.date));
+      const attSnap = await tx.get(attRef);
+
+      const base = attSnap.exists
+        ? attSnap.data()
+        : {
+            date: req.date,
+            empKey: req.empKey,
+            shift: {
+              morning: { checkIn: null, checkOut: null },
+              night: { checkIn: null, checkOut: null },
+            },
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          };
+
+      base.shift = base.shift || {
+        morning: { checkIn: null, checkOut: null },
+        night: { checkIn: null, checkOut: null },
+      };
+      base.shift[req.shiftKey] = base.shift[req.shiftKey] || { checkIn: null, checkOut: null };
+
+      // 若原本無值，才補一個 timestamp（代表已核准補登）
+      if (!base.shift[req.shiftKey][req.actionKey]) {
+        base.shift[req.shiftKey][req.actionKey] = nowTs();
+      }
+
+      // 另外加 meta（不破壞你既有 shift 結構）
+      base.makeupMeta = base.makeupMeta || {};
+      const metaKey = `${req.date}|${req.shiftKey}|${req.actionKey}`;
+      base.makeupMeta[metaKey] = {
+        approved: true,
+        requestId,
+        approvedBy: approver.empKey,
+      };
+
+      base.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.set(attRef, base, { merge: true });
+
+      tx.update(reqRef, {
+        status: "approved",
+        reviewedBy: approver.empKey,
+        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    return client.replyMessage(event.replyToken, { type: "text", text: "✅ 已核准補打卡" });
+  } catch (err) {
+    if (String(err?.message || "").includes("ALREADY_DONE")) {
+      return client.replyMessage(event.replyToken, { type: "text", text: "⚠️ 此申請已被其他人處理" });
+    }
+    console.error("❌ makeup decision error", err);
+    return client.replyMessage(event.replyToken, { type: "text", text: "❌ 處理失敗，請稍後再試" });
+  }
+}
+
+/* =========================
+   Postback handler
+========================= */
+async function onPostback(event) {
+  const data = event.postback.data || "";
+  const userId = event.source.userId;
+  const emp = await getEmployeeByUserId(userId);
+
+  if (!emp) {
+    return client.replyMessage(event.replyToken, { type: "text", text: "你尚未註冊/綁定，請找管理者處理。" });
+  }
+
+  // 打卡：第一層
+  if (data === "CLK_STEP1|IN") return replyClockShiftMenu(event.replyToken, "IN");
+  if (data === "CLK_STEP1|OUT") return replyClockShiftMenu(event.replyToken, "OUT");
+
+  // 打卡：第二層（寫入）
+  if (data.startsWith("CLK_STEP2|")) {
+    const parts = data.split("|"); // CLK_STEP2|IN|早
+    const inOut = parts[1];
+    const shiftLabel = parts[2];
+    const today = formatYMD(new Date());
+
+    try {
+      await writeAttendanceOnce({ empKey: emp.empKey, ymd: today, shiftLabel, inOut });
+      const actionLabel = inOut === "IN" ? "上班" : "下班";
+      return client.replyMessage(event.replyToken, {
+        type: "text",
+        text: `✅ ${today} ${shiftLabel}班 ${actionLabel} 打卡成功`,
+      });
+    } catch (e) {
+      if (String(e?.message || "").includes("ALREADY")) {
+        const actionLabel = inOut === "IN" ? "上班" : "下班";
+        return client.replyMessage(event.replyToken, {
+          type: "text",
+          text: `⚠️ ${today} ${shiftLabel}班 ${actionLabel} 已打過卡`,
+        });
+      }
+      console.error("❌ clock error", e);
+      return client.replyMessage(event.replyToken, { type: "text", text: "❌ 打卡失敗，請稍後再試。" });
+    }
+  }
+
+  // 補打卡核准/拒絕
+  if (data.startsWith("MKP_DECIDE|")) return handleMakeupDecision(event, data);
+
+  return client.replyMessage(event.replyToken, { type: "text", text: "未識別的操作。" });
+}
+
+/* =========================
+   Text handler
+========================= */
+async function onText(event) {
+  const userId = event.source.userId;
+  const text = (event.message.text || "").trim();
+  const emp = await getEmployeeByUserId(userId);
+
+  if (!emp) {
+    return client.replyMessage(event.replyToken, {
+      type: "text",
+      text: "你尚未綁定員工資料（employees）。\n請由管理者在 Firestore 設定你的 userId。",
+    });
+  }
+
+  // 管理層：設定颱風/店休（不做 UI）
+  const exceptionMsg = await handleWorkExceptionCommand(emp, text);
+  if (exceptionMsg) return client.replyMessage(event.replyToken, exceptionMsg);
+
+  // staff：打卡（可由 Rich Menu 直接送出「打卡」）
+  if (text === "打卡") return replyClockMainMenu(event.replyToken);
+
+  // staff：如果 Rich Menu 想做兩顆鍵「上班」「下班」，也支援
+  if (text === "上班") return replyClockShiftMenu(event.replyToken, "IN");
+  if (text === "下班") return replyClockShiftMenu(event.replyToken, "OUT");
+
+  // staff：補打卡（申請）
+  if (text === "補打卡") {
+    return client.replyMessage(event.replyToken, {
+      type: "text",
+      text:
+        "請用格式：\n" +
+        "補打卡 YYYY-MM-DD 早|晚 上班|下班 原因\n" +
+        "例如：補打卡 2025-12-10 早 上班 忘記打卡\n" +
+        "也可用：補打卡 12/10 早 上班 忘記打卡",
+    });
+  }
+
+  // staff：補打卡（完整格式）
+  if (text.startsWith("補打卡")) {
+    const parsed = await parseMakeupText(text);
+    if (!parsed) {
+      return client.replyMessage(event.replyToken, {
+        type: "text",
+        text:
+          "❌ 格式錯誤\n" +
+          "請用：補打卡 YYYY-MM-DD 早|晚 上班|下班 原因\n" +
+          "例如：補打卡 2025-12-10 早 上班 忘記打卡",
+      });
+    }
+    if (parsed.error === "BAD_DATE") {
+      return client.replyMessage(event.replyToken, { type: "text", text: "❌ 日期格式錯誤，請用 2025-12-10 或 12/10" });
+    }
+    if (parsed.error === "FUTURE_DATE") {
+      return client.replyMessage(event.replyToken, { type: "text", text: "❌ 不可申請未來日期的補打卡" });
+    }
+
+    const msg = await createMakeupRequestAndNotify({
+      emp,
+      ymd: parsed.ymd,
+      shiftLabel: parsed.shiftLabel,
+      shiftKey: parsed.shiftKey,
+      actLabel: parsed.actLabel,
+      actionKey: parsed.actionKey,
+      reason: parsed.reason,
+    });
+    return client.replyMessage(event.replyToken, msg);
+  }
+
+  // 借支（目前先關）
+  if (text.startsWith("借支")) {
+    if (!FEATURES.ENABLE_ADVANCE) {
+      return client.replyMessage(event.replyToken, { type: "text", text: "（借支功能尚未啟用）" });
+    }
+  }
+
+  // 預設提示（極簡）
+  return client.replyMessage(event.replyToken, {
+    type: "text",
+    text:
+      "可用指令：\n" +
+      "1) 打卡（或直接點 Rich Menu 上班/下班）\n" +
+      "2) 補打卡（申請制）\n" +
+      "管理層指令：設定颱風/設定店休 YYYY-MM-DD 半天|全天",
   });
 }
 
-/* =============== schedules & calendarDays（可選） =============== */
-async function getSchedule(empNo, date) {
-  // schedules/{empNo}_{YYYY-MM-DD}
-  const ref = db.collection("schedules").doc(`${empNo}_${date}`);
-  const snap = await ref.get();
-  return snap.exists ? snap.data() : null;
-}
-
-async function getCalendarDay(date) {
-  // calendarDays/{YYYY-MM-DD} : {type: open|closed|typhoon_closed|typhoon_half}
-  const ref = db.collection("calendarDays").doc(date);
-  const snap = await ref.get();
-  return snap.exists ? snap.data() : { type: "open" };
-}
-
-/* ================= sessions（只用在補打卡流程） ================= */
-async function setSession(userId, data) {
-  await db.collection("sessions").doc(userId).set(data, { merge: true });
-}
-async function getSession(userId) {
-  const snap = await db.collection("sessions").doc(userId).get();
-  return snap.exists ? snap.data() : null;
-}
-async function clearSession(userId) {
-  await db.collection("sessions").doc(userId).delete().catch(() => {});
-}
-
-/* ================= Attendance Stats (late/early/ot) ================= */
-function calcShiftStats(dateStr, shiftData, scheduleShift) {
-  // shiftData: {checkIn, checkOut} timestamps
-  // scheduleShift: {start:"10:00", end:"14:30"} or null
-  if (!scheduleShift?.start || !scheduleShift?.end) {
-    return { late: 0, early: 0, ot: 0, hasSchedule: false };
-  }
-
-  const start = atDateTime(dateStr, scheduleShift.start);
-  const end = atDateTime(dateStr, scheduleShift.end);
-  if (!start || !end) return { late: 0, early: 0, ot: 0, hasSchedule: false };
-
-  const inAt = toDate(shiftData?.checkIn);
-  const outAt = toDate(shiftData?.checkOut);
-
-  let late = 0, early = 0, ot = 0;
-
-  if (inAt) {
-    const d = minutesDiff(inAt, start);
-    if (d > 0) late = d;
-  }
-  if (outAt) {
-    const d = minutesDiff(outAt, end);
-    if (d > EARLY_OT_THRESHOLD_MINUTES) ot = d;
-    if (d < -EARLY_OT_THRESHOLD_MINUTES) early = -d;
-  }
-
-  return { late, early, ot, hasSchedule: true };
-}
-
-async function calcMonthMetrics(empNo, monthYYYYMM) {
-  // 讀本月 attendance
-  const attSnap = await db
-    .collection("attendance")
-    .where("empNo", "==", empNo)
-    .where("date", ">=", `${monthYYYYMM}-01`)
-    .where("date", "<=", `${monthYYYYMM}-31`)
-    .get();
-
-  // 讀本月已核准補打卡數
-  const makeupSnap = await db
-    .collection("makeupRequests")
-    .where("empNo", "==", empNo)
-    .where("status", "==", "approved")
-    .where("date", ">=", `${monthYYYYMM}-01`)
-    .where("date", "<=", `${monthYYYYMM}-31`)
-    .get();
-
-  let records = 0;
-  let lateMinutes = 0;
-  let lateCount = 0;
-  let earlyMinutes = 0;
-  let overtimeMinutes = 0;
-  let missingScheduleDays = 0;
-
-  for (const doc of attSnap.docs) {
-    const a = doc.data();
-    const date = a.date;
-    const cal = await getCalendarDay(date);
-    if (cal?.type === "closed" || cal?.type === "typhoon_closed") {
-      // 店休 / 停業：不算應出勤日，也不影響全勤；但 attendance 若存在仍不必扣分
-      continue;
-    }
-
-    records += 1;
-
-    const sched = await getSchedule(empNo, date);
-    if (!sched) {
-      // 沒排班：不算遲到/早退/加班（避免算錯）
-      missingScheduleDays += 1;
-      continue;
-    }
-
-    const m = calcShiftStats(date, a.shift?.morning, sched.morning);
-    const n = calcShiftStats(date, a.shift?.night, sched.night);
-
-    const dayLate = m.late + n.late;
-    const dayEarly = m.early + n.early;
-    const dayOT = m.ot + n.ot;
-
-    if ((m.hasSchedule || n.hasSchedule) && dayLate > 0) lateCount += 1;
-    lateMinutes += dayLate;
-    earlyMinutes += dayEarly;
-    overtimeMinutes += dayOT;
-  }
-
-  const makeupApprovedCount = makeupSnap.size;
-
-  // 全勤破功條件（你定義）
-  const brokeByLate =
-    lateCount > 4 || (lateCount <= 4 && lateMinutes > 10);
-  const brokeByMakeup = makeupApprovedCount > 3;
-
-  // 目前沒有請假資料表 leaves，所以先視為 0（之後接 leaves 再納入）
-  const personalLeaveCount = 0;
-  const brokeByLeave = personalLeaveCount > 0;
-
-  const fullAttendanceBroken = brokeByLate || brokeByMakeup || brokeByLeave;
-
-  // 遲到扣薪分鐘（觸發才扣、扣全部遲到分鐘）
-  const lateDeductMinutes = brokeByLate ? lateMinutes : 0;
-
-  return {
-    records,
-    lateMinutes,
-    lateCount,
-    earlyMinutes,
-    overtimeMinutes,
-    makeupApprovedCount,
-    missingScheduleDays,
-    fullAttendanceBroken,
-    lateDeductMinutes,
-  };
-}
-
-/* ================= Quick Reply Menus ================= */
-function staffMenu(empNo) {
-  return {
-    type: "text",
-    text: `📍 選單（${empNo}）`,
-    quickReply: {
-      items: [
-        { type: "action", action: { type: "message", label: "打卡", text: "打卡" } },
-        { type: "action", action: { type: "message", label: "補打卡", text: "補打卡" } },
-        { type: "action", action: { type: "message", label: "本月摘要", text: "本月摘要" } },
-      ],
-    },
-  };
-}
-function adminMenu(empNo) {
-  return {
-    type: "text",
-    text: `👑 老闆選單（${empNo}）`,
-    quickReply: {
-      items: [
-        { type: "action", action: { type: "message", label: "補打卡申請", text: "補打卡申請" } },
-        { type: "action", action: { type: "message", label: "本月摘要", text: "本月摘要" } },
-        { type: "action", action: { type: "message", label: "薪資試算", text: "薪資試算" } },
-      ],
-    },
-  };
-}
-
-/* ================= Webhook ================= */
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  try {
-    await Promise.all(req.body.events.map(handleEvent));
-    res.status(200).end();
-  } catch (e) {
-    console.error("❌ webhook batch error:", e);
-    res.status(500).end();
-  }
-});
-
-/* ================= Main Handler (Hardened) ================= */
-async function handleEvent(event) {
-  // 每個 event 自己 catch：避免「整個 webhook 無回應」
-  try {
-    if (event.type !== "message" || event.message.type !== "text") return;
-    if (event.source.type !== "user") {
-      return reply(event.replyToken, { type: "text", text: "⚠️ 請私聊官方帳操作" });
-    }
-
-    const userId = event.source.userId;
-    const text = event.message.text.trim();
-    const token = event.replyToken;
-
-    /* ====== 自助編號註冊（未註冊者也能用） ====== */
-    // 格式：註冊 A006
-    if (FEATURES.SELF_REGISTER_BY_CODE && /^註冊\s+A\d{3}$/i.test(text)) {
-      const empNo = text.replace(/\s+/g, "").toUpperCase().replace("註冊", "");
-      // userId 是否已綁過任何人
-      if (await employeeUserIdAlreadyBound(userId)) {
-        const already = await getEmployeeByUserId(userId);
-        return reply(token, { type: "text", text: `你已註冊為 ${already.empNo}，請輸入「打卡」` });
-      }
-      // 目標編號是否存在
-      const target = await getEmployeeByEmpNo(empNo);
-      if (!target) {
-        return reply(token, { type: "text", text: "❌ 員工編號不存在，請確認" });
-      }
-      // 防呆：admin 編號不允許自助綁定（避免有人亂綁 A001）
-      if ((target.role || "").toLowerCase() === "admin") {
-        return reply(token, { type: "text", text: "❌ 此編號需由管理員後台綁定" });
-      }
-      // 防呆：編號已被綁
-      if (target.userId) {
-        return reply(token, { type: "text", text: "❌ 此編號已被註冊，請洽管理員" });
-      }
-
-      await target._ref.update({
-        userId,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return reply(token, {
-        type: "text",
-        text: `✅ 註冊成功：${empNo}\n請輸入「打卡」開始使用`,
-      });
-    }
-
-    /* ====== 先找 employee（已註冊者） ====== */
-    const emp = await getEmployeeByUserId(userId);
-    if (!emp) {
-      return reply(token, {
-        type: "text",
-        text: "你尚未註冊。\n請輸入：註冊 A00X\n例如：註冊 A006",
-      });
-    }
-
-    /* ====== 選單 ====== */
-    if (text === "選單") {
-      return reply(token, emp.role === "admin" ? adminMenu(emp.empNo) : staffMenu(emp.empNo));
-    }
-
-    /* ================= 打卡（基準 UX 固定） ================= */
-    if (FEATURES.ATTENDANCE && (text === "打卡" || text === "開始")) {
-      return reply(token, {
-        type: "text",
-        text: `📍 打卡選單（${emp.empNo}）`,
-        quickReply: {
-          items: [
-            { type: "action", action: { type: "message", label: "早班上班", text: "早班上班" } },
-            { type: "action", action: { type: "message", label: "早班下班", text: "早班下班" } },
-            { type: "action", action: { type: "message", label: "晚班上班", text: "晚班上班" } },
-            { type: "action", action: { type: "message", label: "晚班下班", text: "晚班下班" } },
-          ],
-        },
-      });
-    }
-
-    if (text === "早班上班") {
-      await punch(emp.empNo, todayStr(), "morning", "checkIn", "normal");
-      return reply(token, { type: "text", text: "✅ 早班上班打卡完成" });
-    }
-    if (text === "早班下班") {
-      await punch(emp.empNo, todayStr(), "morning", "checkOut", "normal");
-      return reply(token, { type: "text", text: "✅ 早班下班打卡完成" });
-    }
-    if (text === "晚班上班") {
-      await punch(emp.empNo, todayStr(), "night", "checkIn", "normal");
-      return reply(token, { type: "text", text: "✅ 晚班上班打卡完成" });
-    }
-    if (text === "晚班下班") {
-      await punch(emp.empNo, todayStr(), "night", "checkOut", "normal");
-      return reply(token, { type: "text", text: "✅ 晚班下班打卡完成" });
-    }
-
-    /* ================= 補打卡（員工申請） ================= */
-    if (FEATURES.MAKEUP && emp.role === "staff" && text === "補打卡") {
-      await setSession(userId, { flow: "makeup", step: "pickShift" });
-      return reply(token, {
-        type: "text",
-        text: "請選擇補打卡班別",
-        quickReply: {
-          items: [
-            { type: "action", action: { type: "message", label: "早班", text: "補_早班" } },
-            { type: "action", action: { type: "message", label: "晚班", text: "補_晚班" } },
-          ],
-        },
-      });
-    }
-
-    const session = await getSession(userId);
-
-    if (FEATURES.MAKEUP && emp.role === "staff" && session?.flow === "makeup") {
-      if (session.step === "pickShift" && (text === "補_早班" || text === "補_晚班")) {
-        await setSession(userId, {
-          flow: "makeup",
-          step: "pickType",
-          shift: text === "補_早班" ? "morning" : "night",
-        });
-        return reply(token, {
-          type: "text",
-          text: "請選擇補打卡類型",
-          quickReply: {
-            items: [
-              { type: "action", action: { type: "message", label: "上班", text: "補_上班" } },
-              { type: "action", action: { type: "message", label: "下班", text: "補_下班" } },
-            ],
-          },
-        });
-      }
-
-      if (session.step === "pickType" && (text === "補_上班" || text === "補_下班")) {
-        await setSession(userId, {
-          ...session,
-          step: "reason",
-          type: text === "補_上班" ? "checkIn" : "checkOut",
-        });
-        return reply(token, { type: "text", text: "請輸入補打卡原因" });
-      }
-
-      if (session.step === "reason") {
-        await db.collection("makeupRequests").add({
-          empNo: emp.empNo,
-          date: todayStr(),
-          shift: session.shift,
-          type: session.type,
-          reason: text,
-          status: "pending",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await clearSession(userId);
-        return reply(token, { type: "text", text: "📨 補打卡申請已送出，等待老闆核准" });
-      }
-    }
-
-    /* ================= 補打卡（老闆核准） ================= */
-    if (FEATURES.MAKEUP && emp.role === "admin" && text === "補打卡申請") {
-      // 不用 orderBy，避免 Firestore index 直接炸
-      const q = await db.collection("makeupRequests")
-        .where("status", "==", "pending")
-        .limit(1)
-        .get();
-
-      if (q.empty) {
-        return reply(token, { type: "text", text: "目前沒有補打卡申請" });
-      }
-
-      const doc = q.docs[0];
-      const r = doc.data();
-
-      await punch(r.empNo, r.date, r.shift, r.type, "makeup");
-      await doc.ref.update({
-        status: "approved",
-        reviewedBy: emp.empNo,
-        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return reply(token, { type: "text", text: `✅ 已核准 ${r.empNo} 補打卡（${r.date}）` });
-    }
-
-    /* ================= 本月摘要（顯示用） ================= */
-    if (FEATURES.SUMMARY && text === "本月摘要") {
-      const m = await calcMonthMetrics(emp.empNo, monthPrefix());
-
-      const scheduleHint =
-        m.missingScheduleDays > 0
-          ? `\n⚠️ 有 ${m.missingScheduleDays} 筆缺排班，遲到/早退/加班未計入`
-          : "";
-
-      return reply(token, {
-        type: "text",
-        text:
-          `📊 本月摘要（${emp.empNo}）\n` +
-          `出勤筆數：${m.records}\n` +
-          `遲到次數：${m.lateCount}\n` +
-          `遲到分鐘：${m.lateMinutes}\n` +
-          `早退分鐘：${m.earlyMinutes}\n` +
-          `加班分鐘：${m.overtimeMinutes}\n` +
-          `核准補打卡：${m.makeupApprovedCount} 次\n` +
-          `全勤狀態：${m.fullAttendanceBroken ? "破功" : "✅ 未破功"}` +
-          scheduleHint,
-      });
-    }
-
-    /* ================= 薪資試算（制度版） ================= */
-    if (FEATURES.PAYROLL && text === "薪資試算") {
-      const monthlySalary = (emp.baseSalary || 0) + (emp.positionAllowance || 0);
-      const perMinute = monthlySalary / MONTHLY_DIVISOR_DAYS / STANDARD_DAILY_MINUTES;
-
-      const m = await calcMonthMetrics(emp.empNo, monthPrefix());
-      const lateDeductAmount = Math.round(m.lateDeductMinutes * perMinute);
-
-      const payable = monthlySalary - lateDeductAmount;
-
-      return reply(token, {
-        type: "text",
-        text:
-          `💰 薪資試算（${emp.empNo}）\n` +
-          `月薪：${monthlySalary}\n` +
-          `基準：30天、每日540分鐘\n` +
-          `遲到次數：${m.lateCount}\n` +
-          `遲到總分鐘：${m.lateMinutes}\n` +
-          `遲到扣薪分鐘：${m.lateDeductMinutes}\n` +
-          `遲到扣薪：${lateDeductAmount}\n` +
-          `應發：${payable}\n\n` +
-          `備註：遲到扣薪門檻＝(次數>4) 或 (次數<=4且總分鐘>10)，觸發後扣「全部遲到分鐘」`,
-      });
-    }
-
-    /* ================= fallback ================= */
-    if (text === "老闆" && emp.role === "admin") {
-      return reply(token, adminMenu(emp.empNo));
-    }
-    if (text === "員工" && emp.role === "staff") {
-      return reply(token, staffMenu(emp.empNo));
-    }
-
-    return reply(token, { type: "text", text: "請輸入「打卡」或「選單」" });
-
-  } catch (err) {
-    console.error("❌ handleEvent error:", err);
-    // 重要：發生錯誤也要回覆，避免「完全沒回應」
-    try {
-      return reply(event.replyToken, {
-        type: "text",
-        text: "⚠️ 系統剛剛發生錯誤，請再試一次。如果一直出現請通知工程師。",
-      });
-    } catch (_) {}
-  }
-}
-
-/* ================= Server ================= */
+/* =========================
+   Start server
+========================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("🚀 FINAL hardened system running on port", PORT);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
