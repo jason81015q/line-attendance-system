@@ -43,9 +43,14 @@ async function handleEvent(event) {
   const text = event.message.text.trim();
   const userId = event.source.userId;
 
+  /* ===== 註冊（綁定員工編號）===== */
+  if (text.startsWith("註冊")) {
+    return handleRegister(event, text);
+  }
+
   const emp = await getEmployeeByUserId(userId);
   if (!emp) {
-    return reply(event, "❌ 尚未綁定員工資料");
+    return reply(event, "❌ 尚未綁定員工資料，請先輸入：註冊 A001");
   }
 
   /* ===== 設定供餐（admin only）===== */
@@ -58,6 +63,7 @@ async function handleEvent(event) {
     return handleMakeupDecision(event, text);
   }
 
+  /* 其他功能你現有的都還在 */
   return reply(event, "❓ 指令不正確");
 }
 
@@ -69,6 +75,7 @@ async function getEmployeeByUserId(userId) {
     .where("userId", "==", userId)
     .limit(1)
     .get();
+
   if (snap.empty) return null;
   return { empKey: snap.docs[0].id, ...snap.docs[0].data() };
 }
@@ -80,6 +87,38 @@ function reply(event, text) {
   });
 }
 
+/* ================== 註冊（綁定 Axxx） ================== */
+
+async function handleRegister(event, text) {
+  const empKey = text.replace("註冊", "").trim();
+  const userId = event.source.userId;
+
+  if (!empKey) {
+    return reply(event, "❌ 請輸入：註冊 A001");
+  }
+
+  const ref = db.collection("employees").doc(empKey);
+  const snap = await ref.get();
+
+  if (!snap.exists) {
+    return reply(event, "❌ 員工編號不存在，請確認");
+  }
+
+  if (snap.data().userId) {
+    return reply(event, "⚠️ 此員工編號已被綁定");
+  }
+
+  await ref.update({
+    userId,
+    boundAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return reply(
+    event,
+    `✅ 已成功綁定 ${snap.data().displayName || empKey}`
+  );
+}
+
 /* ================== 設定供餐（防重複） ================== */
 
 async function handleCompanyMealSetting(event, emp, text) {
@@ -87,7 +126,7 @@ async function handleCompanyMealSetting(event, emp, text) {
     return reply(event, "❌ 你沒有權限");
   }
 
-  // 指令格式：設定供餐 2025-12-10 早班
+  // 格式：設定供餐 2025-12-10 早班
   const parts = text.split(" ");
   if (parts.length !== 3) {
     return reply(event, "❌ 格式錯誤\n設定供餐 YYYY-MM-DD 早班/晚班");
@@ -110,10 +149,7 @@ async function handleCompanyMealSetting(event, emp, text) {
 
   const snap = await ref.get();
   if (snap.exists) {
-    return reply(
-      event,
-      `⚠️ ${date} ${shiftText} 已設定供餐（不會重複建立）`
-    );
+    return reply(event, `⚠️ ${date} ${shiftText} 已設定供餐`);
   }
 
   await ref.set({
@@ -148,7 +184,6 @@ async function handleMakeupDecision(event, text) {
       const req = snap.data();
       if (req.status !== "pending") throw new Error("ALREADY_HANDLED");
 
-      // 🔒 防止自己核准自己
       if (req.requesterUserId === userId) {
         throw new Error("SELF_APPROVAL");
       }
