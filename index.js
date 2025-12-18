@@ -25,16 +25,10 @@ const db = admin.firestore();
 
 /* ================= 工具 ================= */
 
-const reply = (event, text) =>
-  client.replyMessage(event.replyToken, { type: "text", text });
+const reply = (event, msg) =>
+  client.replyMessage(event.replyToken, msg);
 
-const toBool = (v) =>
-  v === true || (typeof v === "string" && v.toLowerCase() === "true");
-
-const todayISO = () => {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
-};
+const todayISO = () => new Date().toISOString().slice(0, 10);
 
 async function getEmployee(userId) {
   const snap = await db
@@ -43,19 +37,8 @@ async function getEmployee(userId) {
     .limit(1)
     .get();
   if (snap.empty) return null;
-
   const doc = snap.docs[0];
-  const data = doc.data();
-  return {
-    empKey: doc.id,
-    ...data,
-    canApprove: toBool(data.canApprove),
-    role: data.role || "staff",
-  };
-}
-
-async function linkMenu(userId, menuId) {
-  if (menuId) await client.linkRichMenuToUser(userId, menuId);
+  return { empKey: doc.id, ...doc.data() };
 }
 
 /* ================= Webhook ================= */
@@ -78,136 +61,160 @@ async function handleEvent(event) {
   const text = event.message.text.trim();
   const userId = event.source.userId;
 
-  /* -------- 註冊 -------- */
-  if (text.startsWith("註冊")) {
-    const empKey = text.replace("註冊", "").trim();
-    const ref = db.collection("employees").doc(empKey);
-    const snap = await ref.get();
-
-    if (!snap.exists) return reply(event, "❌ 員工編號不存在");
-    if (snap.data().userId)
-      return reply(event, "⚠️ 此編號已被綁定");
-
-    await ref.update({
-      userId,
-      boundAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    const emp = await getEmployee(userId);
-
-    if (emp.role === "admin") {
-      await linkMenu(userId, process.env.ADMIN_RICHMENU_ID);
-    } else if (emp.canApprove) {
-      await linkMenu(userId, process.env.HYBRID_RICHMENU_ID);
-    } else {
-      await linkMenu(userId, process.env.STAFF_RICHMENU_ID);
-    }
-
-    return reply(event, "✅ 註冊成功，已套用對應操作介面");
-  }
-
   const emp = await getEmployee(userId);
   if (!emp)
-    return reply(event, "❌ 尚未註冊，請輸入：註冊 A001");
+    return reply(event, {
+      type: "text",
+      text: "❌ 尚未註冊\n請輸入：註冊 A001",
+    });
 
-  /* -------- Rich Menu Codes -------- */
+  /* ========= 打卡 ========= */
 
   if (text === "CLOCK") {
-    return reply(
-      event,
-      "請輸入：\n早班上班 / 早班下班 / 晚班上班 / 晚班下班"
-    );
+    return reply(event, {
+      type: "text",
+      text: "請選擇打卡類型",
+      quickReply: {
+        items: [
+          qr("早班上班"),
+          qr("早班下班"),
+          qr("晚班上班"),
+          qr("晚班下班"),
+        ],
+      },
+    });
   }
 
-  if (
-    ["早班上班", "早班下班", "晚班上班", "晚班下班"].includes(text)
-  ) {
+  if (["早班上班", "早班下班", "晚班上班", "晚班下班"].includes(text)) {
     return handleClock(event, emp, text);
   }
 
+  /* ========= 補打卡 ========= */
+
   if (text === "MAKEUP_APPLY") {
-    return reply(
-      event,
-      "請輸入：\n補打卡 YYYY-MM-DD 早班/晚班 上班/下班 原因"
-    );
+    return startMakeupFlow(event, emp);
   }
 
-  if (text.startsWith("補打卡 ")) {
-    return handleMakeupApply(event, emp, text);
+  if (text.startsWith("MAKEUP_DATE|")) {
+    return selectMakeupDate(event, emp, text);
   }
 
-  if (text === "MAKEUP_ADMIN") {
-    if (!emp.canApprove) return reply(event, "❌ 無核准權限");
-    return reply(
-      event,
-      "系統會在有申請時主動通知你\n請點通知內的核准指令"
-    );
+  if (text.startsWith("MAKEUP_SHIFT|")) {
+    return selectMakeupShift(event, emp, text);
   }
+
+  if (text.startsWith("MAKEUP_ACTION|")) {
+    return selectMakeupAction(event, emp, text);
+  }
+
+  if (text.startsWith("MAKEUP_REASON|")) {
+    return submitMakeup(event, emp, text);
+  }
+
+  /* ========= 核准 ========= */
 
   if (text.startsWith("MAKEUP|")) {
     return handleMakeupDecision(event, emp, text);
   }
 
-  if (text === "SET_EXCEPTION") {
-    if (!emp.canApprove) return reply(event, "❌ 無權限");
-    return reply(
-      event,
-      "請輸入：\n例外 YYYY-MM-DD 類型\n例：例外 2025-12-31 颱風半天"
-    );
-  }
-
-  if (text.startsWith("例外 ")) {
-    return handleException(event, emp, text);
-  }
-
-  return reply(event, "❓ 無法識別的指令");
+  return reply(event, { type: "text", text: "❓ 請使用選單操作" });
 }
 
 /* ================= 打卡 ================= */
 
 async function handleClock(event, emp, text) {
-  const shift = text.startsWith("早班") ? "morning" : "night";
-  const action = text.endsWith("上班") ? "checkIn" : "checkOut";
+  const map = {
+    "早班上班": ["morning", "checkIn"],
+    "早班下班": ["morning", "checkOut"],
+    "晚班上班": ["night", "checkIn"],
+    "晚班下班": ["night", "checkOut"],
+  };
+
+  const [shift, action] = map[text];
   const date = todayISO();
-  const docId = `${emp.empKey}_${date}`;
-  const ref = db.collection("attendance").doc(docId);
+  const ref = db.collection("attendance").doc(`${emp.empKey}_${date}`);
 
-  const snap = await ref.get();
-  const base =
-    snap.exists
-      ? snap.data()
-      : {
-          empKey: emp.empKey,
-          date,
-          shift: {
-            morning: { checkIn: null, checkOut: null },
-            night: { checkIn: null, checkOut: null },
-          },
-        };
+  await ref.set(
+    {
+      empKey: emp.empKey,
+      date,
+      shift: {
+        [shift]: {
+          [action]: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      },
+    },
+    { merge: true }
+  );
 
-  if (base.shift[shift][action])
-    return reply(event, "⚠️ 已打過卡");
-
-  base.shift[shift][action] =
-    admin.firestore.FieldValue.serverTimestamp();
-
-  await ref.set(base, { merge: true });
-  return reply(event, "✅ 打卡成功");
+  return reply(event, { type: "text", text: "✅ 打卡成功" });
 }
 
-/* ================= 補打卡 ================= */
+/* ================= 補打卡流程 ================= */
 
-async function handleMakeupApply(event, emp, text) {
-  const [, date, shiftText, actText, ...rest] = text.split(" ");
-  const reason = rest.join(" ");
+function qr(text) {
+  return { type: "action", action: { type: "message", label: text, text } };
+}
 
-  const shift =
-    shiftText === "早班" ? "morning" : shiftText === "晚班" ? "night" : null;
-  const action =
-    actText === "上班" ? "checkIn" : actText === "下班" ? "checkOut" : null;
+async function startMakeupFlow(event, emp) {
+  const dates = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    dates.push(d.toISOString().slice(0, 10));
+  }
 
-  if (!shift || !action || !reason)
-    return reply(event, "❌ 格式錯誤");
+  return reply(event, {
+    type: "text",
+    text: "請選擇要補打卡的日期",
+    quickReply: {
+      items: dates.map((d) => qr(`MAKEUP_DATE|${d}`)),
+    },
+  });
+}
+
+async function selectMakeupDate(event, emp, text) {
+  const date = text.split("|")[1];
+  return reply(event, {
+    type: "text",
+    text: `補打卡日期：${date}\n請選擇班別`,
+    quickReply: {
+      items: [
+        qr(`MAKEUP_SHIFT|${date}|morning`),
+        qr(`MAKEUP_SHIFT|${date}|night`),
+      ],
+    },
+  });
+}
+
+async function selectMakeupShift(event, emp, text) {
+  const [, date, shift] = text.split("|");
+  return reply(event, {
+    type: "text",
+    text: "請選擇動作",
+    quickReply: {
+      items: [
+        qr(`MAKEUP_ACTION|${date}|${shift}|checkIn`),
+        qr(`MAKEUP_ACTION|${date}|${shift}|checkOut`),
+      ],
+    },
+  });
+}
+
+async function selectMakeupAction(event, emp, text) {
+  const [, date, shift, action] = text.split("|");
+  return reply(event, {
+    type: "text",
+    text: "請輸入補打卡原因",
+    quickReply: {
+      items: [qr(`MAKEUP_REASON|${date}|${shift}|${action}`)],
+    },
+  });
+}
+
+async function submitMakeup(event, emp, text) {
+  const [, date, shift, action] = text.split("|");
+  const reason = event.message.text.replace(text, "").trim();
 
   const ref = await db.collection("makeupRequests").add({
     empKey: emp.empKey,
@@ -220,9 +227,11 @@ async function handleMakeupApply(event, emp, text) {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  await notifyApprovers(emp, date, shiftText, actText, reason, ref.id);
-  return reply(event, "📨 已送出補打卡申請");
+  await notifyApprovers(emp, date, shift, action, reason, ref.id);
+  return reply(event, { type: "text", text: "📨 已送出補打卡申請" });
 }
+
+/* ================= 核准 ================= */
 
 async function notifyApprovers(emp, date, shift, action, reason, id) {
   const snap = await db
@@ -237,60 +246,39 @@ async function notifyApprovers(emp, date, shift, action, reason, id) {
     await client.pushMessage(u, {
       type: "text",
       text:
-        `📌 補打卡申請\n員工：${emp.empKey}\n日期：${date}\n班別：${shift}\n動作：${action}\n原因：${reason}\n\n` +
-        `同意：MAKEUP|APPROVE|${id}\n拒絕：MAKEUP|REJECT|${id}`,
+        `📌 補打卡申請\n員工：${emp.empKey}\n日期：${date}\n班別：${shift}\n動作：${action}\n原因：${reason}`,
+      quickReply: {
+        items: [
+          qr(`MAKEUP|APPROVE|${id}`),
+          qr(`MAKEUP|REJECT|${id}`),
+        ],
+      },
     });
   }
 }
 
 async function handleMakeupDecision(event, emp, text) {
-  if (!emp.canApprove) return reply(event, "❌ 無權限");
+  if (!emp.canApprove)
+    return reply(event, { type: "text", text: "❌ 無權限" });
 
   const [, action, id] = text.split("|");
   const ref = db.collection("makeupRequests").doc(id);
 
-  try {
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      if (!snap.exists) throw "NOT_FOUND";
-      const req = snap.data();
-      if (req.status !== "pending") throw "DONE";
-      if (req.requesterUserId === emp.userId) throw "SELF";
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new Error();
+    const req = snap.data();
+    if (req.status !== "pending") throw new Error();
+    if (req.requesterUserId === emp.userId) throw new Error();
 
-      tx.update(ref, {
-        status: action === "APPROVE" ? "approved" : "rejected",
-        reviewedBy: emp.empKey,
-        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+    tx.update(ref, {
+      status: action === "APPROVE" ? "approved" : "rejected",
+      reviewedBy: emp.empKey,
+      reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-
-    return reply(event, "✅ 已處理");
-  } catch {
-    return reply(event, "❌ 無法處理此申請");
-  }
-}
-
-/* ================= 例外 ================= */
-
-async function handleException(event, emp, text) {
-  if (!emp.canApprove) return reply(event, "❌ 無權限");
-
-  const [, date, ...rest] = text.split(" ");
-  const type = rest.join(" ");
-  const id = `${date}_${type}`;
-
-  const ref = db.collection("workExceptions").doc(id);
-  if ((await ref.get()).exists)
-    return reply(event, "⚠️ 已設定過");
-
-  await ref.set({
-    date,
-    type,
-    createdBy: emp.empKey,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  return reply(event, "✅ 已設定例外");
+  return reply(event, { type: "text", text: "✅ 已處理" });
 }
 
 /* ================= Server ================= */
