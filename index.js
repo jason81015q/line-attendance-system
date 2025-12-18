@@ -25,10 +25,10 @@ const db = admin.firestore();
 
 /* ================= Rich Menu ID ================= */
 
-const RM_ENTRY = process.env.RICH_MENU_ENTRY;        // richmenu-18394955
-const RM_STAFF = process.env.RICH_MENU_STAFF;        // richmenu-18394962
-const RM_APPROVER = process.env.RICH_MENU_APPROVER;  // richmenu-18394815
-const RM_ADMIN = process.env.RICH_MENU_ADMIN;        // richmenu-18374771
+const RM_ENTRY = process.env.RICH_MENU_ENTRY;
+const RM_STAFF = process.env.RICH_MENU_STAFF;
+const RM_APPROVER = process.env.RICH_MENU_APPROVER;
+const RM_ADMIN = process.env.RICH_MENU_ADMIN;
 
 /* ================= 工具 ================= */
 
@@ -54,27 +54,24 @@ async function getEmployee(userId) {
   return { empKey: doc.id, ...doc.data() };
 }
 
-/* ================= Rich Menu 分流核心 ================= */
+/* ================= Rich Menu 分流 ================= */
 
 async function applyRichMenuByRole(userId, emp) {
   let richMenuId = RM_STAFF;
 
-  // ⚠️ 判斷順序非常重要
   if (emp.role === "admin") {
     richMenuId = RM_ADMIN;
-  } else if (emp.role === "staff" && emp.canApprove === true) {
+  } else if (emp.role === "staff" && emp.canApprove === "true") {
     richMenuId = RM_APPROVER;
-  } else {
-    richMenuId = RM_STAFF;
   }
 
   await client.linkRichMenuToUser(userId, richMenuId);
 }
 
-/* ================= 權限判斷 ================= */
+/* ================= 權限 ================= */
 
 function canApproveMakeup(emp) {
-  return emp.role === "admin" || emp.canApprove === true;
+  return emp.role === "admin" || emp.canApprove === "true";
 }
 
 /* ================= Webhook ================= */
@@ -92,18 +89,49 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 /* ================= 主流程 ================= */
 
 async function handleEvent(event) {
-  const userId = event.source.userId;
-
-  // 只處理文字（Rich Menu 也是 text）
   if (event.type !== "message" || event.message.type !== "text") return;
 
   const text = event.message.text.trim();
+  const userId = event.source.userId;
+
+  /* ===== 註冊流程（一定要在最前面） ===== */
+  if (text.startsWith("註冊")) {
+    const empKey = text.replace("註冊", "").trim();
+    const ref = db.collection("employees").doc(empKey);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return reply(event, {
+        type: "text",
+        text: "❌ 查無此員工代號，請確認後再試",
+      });
+    }
+
+    const data = snap.data();
+    if (data.userId) {
+      return reply(event, {
+        type: "text",
+        text: "⚠️ 此代號已被註冊，請聯絡管理員",
+      });
+    }
+
+    await ref.update({
+      userId,
+      boundAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await applyRichMenuByRole(userId, { empKey, ...data });
+
+    return reply(event, {
+      type: "text",
+      text: `✅ 註冊完成，歡迎 ${data.displayName}`,
+    });
+  }
 
   /* ===== 查員工 ===== */
 
   const emp = await getEmployee(userId);
 
-  // 未註冊 → 強制 Entry Menu
   if (!emp) {
     if (RM_ENTRY) {
       await client.linkRichMenuToUser(userId, RM_ENTRY);
@@ -114,7 +142,6 @@ async function handleEvent(event) {
     });
   }
 
-  // 已註冊 → 自動分流 Rich Menu
   await applyRichMenuByRole(userId, emp);
 
   /* ================= 打卡 ================= */
@@ -140,37 +167,21 @@ async function handleEvent(event) {
 
   /* ================= 補打卡 ================= */
 
-  if (text === "MAKEUP_APPLY") {
-    return startMakeupFlow(event, emp);
-  }
+  if (text === "MAKEUP_APPLY") return startMakeupFlow(event);
 
-  if (text.startsWith("MAKEUP_DATE|")) {
-    return selectMakeupDate(event, emp, text);
-  }
-
-  if (text.startsWith("MAKEUP_SHIFT|")) {
-    return selectMakeupShift(event, emp, text);
-  }
-
-  if (text.startsWith("MAKEUP_ACTION|")) {
-    return selectMakeupAction(event, emp, text);
-  }
-
-  if (text.startsWith("MAKEUP_REASON|")) {
-    return submitMakeup(event, emp, text);
-  }
+  if (text.startsWith("MAKEUP_DATE|")) return selectMakeupDate(event, text);
+  if (text.startsWith("MAKEUP_SHIFT|")) return selectMakeupShift(event, text);
+  if (text.startsWith("MAKEUP_ACTION|")) return selectMakeupAction(event, text);
+  if (text.startsWith("MAKEUP_REASON|")) return submitMakeup(event, emp, text);
 
   /* ================= 核准 ================= */
 
-  if (text.startsWith("MAKEUP|")) {
-    return handleMakeupDecision(event, emp, text);
-  }
+  if (text.startsWith("MAKEUP|")) return handleMakeupDecision(event, emp, text);
 
-  // 封死亂打字（企業內部系統推薦）
   return null;
 }
 
-/* ================= 打卡處理 ================= */
+/* ================= 打卡 ================= */
 
 async function handleClock(event, emp, text) {
   const map = {
@@ -182,27 +193,29 @@ async function handleClock(event, emp, text) {
 
   const [shift, action] = map[text];
   const date = todayISO();
-  const ref = db.collection("attendance").doc(`${emp.empKey}_${date}`);
 
-  await ref.set(
-    {
-      empKey: emp.empKey,
-      date,
-      shift: {
-        [shift]: {
-          [action]: admin.firestore.FieldValue.serverTimestamp(),
+  await db
+    .collection("attendance")
+    .doc(`${emp.empKey}_${date}`)
+    .set(
+      {
+        empKey: emp.empKey,
+        date,
+        shift: {
+          [shift]: {
+            [action]: admin.firestore.FieldValue.serverTimestamp(),
+          },
         },
       },
-    },
-    { merge: true }
-  );
+      { merge: true }
+    );
 
   return reply(event, { type: "text", text: "✅ 打卡成功" });
 }
 
 /* ================= 補打卡流程 ================= */
 
-async function startMakeupFlow(event, emp) {
+async function startMakeupFlow(event) {
   const dates = [];
   for (let i = 1; i <= 7; i++) {
     const d = new Date();
@@ -213,17 +226,15 @@ async function startMakeupFlow(event, emp) {
   return reply(event, {
     type: "text",
     text: "請選擇要補打卡的日期",
-    quickReply: {
-      items: dates.map((d) => qr(`MAKEUP_DATE|${d}`)),
-    },
+    quickReply: { items: dates.map((d) => qr(`MAKEUP_DATE|${d}`)) },
   });
 }
 
-async function selectMakeupDate(event, emp, text) {
+async function selectMakeupDate(event, text) {
   const date = text.split("|")[1];
   return reply(event, {
     type: "text",
-    text: `補打卡日期：${date}\n請選擇班別`,
+    text: `補打卡日期：${date}`,
     quickReply: {
       items: [
         qr(`MAKEUP_SHIFT|${date}|morning`),
@@ -233,7 +244,7 @@ async function selectMakeupDate(event, emp, text) {
   });
 }
 
-async function selectMakeupShift(event, emp, text) {
+async function selectMakeupShift(event, text) {
   const [, date, shift] = text.split("|");
   return reply(event, {
     type: "text",
@@ -247,7 +258,7 @@ async function selectMakeupShift(event, emp, text) {
   });
 }
 
-async function selectMakeupAction(event, emp, text) {
+async function selectMakeupAction(event, text) {
   const [, date, shift, action] = text.split("|");
   return reply(event, {
     type: "text",
@@ -274,10 +285,11 @@ async function submitMakeup(event, emp, text) {
   });
 
   await notifyApprovers(emp, date, shift, action, reason, ref.id);
+
   return reply(event, { type: "text", text: "📨 已送出補打卡申請" });
 }
 
-/* ================= 核准流程 ================= */
+/* ================= 核准 ================= */
 
 async function notifyApprovers(emp, date, shift, action, reason, id) {
   const snap = await db.collection("employees").get();
@@ -285,7 +297,7 @@ async function notifyApprovers(emp, date, shift, action, reason, id) {
   for (const doc of snap.docs) {
     const u = doc.data();
     if (!u.userId) continue;
-    if (!(u.role === "admin" || u.canApprove === true)) continue;
+    if (!(u.role === "admin" || u.canApprove === "true")) continue;
 
     await client.pushMessage(u.userId, {
       type: "text",
@@ -302,19 +314,16 @@ async function notifyApprovers(emp, date, shift, action, reason, id) {
 }
 
 async function handleMakeupDecision(event, emp, text) {
-  if (!canApproveMakeup(emp)) {
+  if (!canApproveMakeup(emp))
     return reply(event, { type: "text", text: "❌ 無權限" });
-  }
 
   const [, action, id] = text.split("|");
   const ref = db.collection("makeupRequests").doc(id);
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
-    if (!snap.exists) throw new Error();
     const req = snap.data();
     if (req.status !== "pending") throw new Error();
-    if (req.requesterUserId === emp.userId) throw new Error();
 
     tx.update(ref, {
       status: action === "APPROVE" ? "approved" : "rejected",
