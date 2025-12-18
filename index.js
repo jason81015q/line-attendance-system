@@ -23,12 +23,25 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
+/* ================= Rich Menu ID ================= */
+
+const RM_ENTRY = process.env.RICH_MENU_ENTRY;        // richmenu-18394955
+const RM_STAFF = process.env.RICH_MENU_STAFF;        // richmenu-18394962
+const RM_APPROVER = process.env.RICH_MENU_APPROVER;  // richmenu-18394815
+const RM_ADMIN = process.env.RICH_MENU_ADMIN;        // richmenu-18374771
+
 /* ================= 工具 ================= */
 
 const reply = (event, msg) =>
   client.replyMessage(event.replyToken, msg);
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
+
+function qr(text) {
+  return { type: "action", action: { type: "message", label: text, text } };
+}
+
+/* ================= Firebase ================= */
 
 async function getEmployee(userId) {
   const snap = await db
@@ -39,6 +52,29 @@ async function getEmployee(userId) {
   if (snap.empty) return null;
   const doc = snap.docs[0];
   return { empKey: doc.id, ...doc.data() };
+}
+
+/* ================= Rich Menu 分流核心 ================= */
+
+async function applyRichMenuByRole(userId, emp) {
+  let richMenuId = RM_STAFF;
+
+  // ⚠️ 判斷順序非常重要
+  if (emp.role === "admin") {
+    richMenuId = RM_ADMIN;
+  } else if (emp.role === "staff" && emp.canApprove === true) {
+    richMenuId = RM_APPROVER;
+  } else {
+    richMenuId = RM_STAFF;
+  }
+
+  await client.linkRichMenuToUser(userId, richMenuId);
+}
+
+/* ================= 權限判斷 ================= */
+
+function canApproveMakeup(emp) {
+  return emp.role === "admin" || emp.canApprove === true;
 }
 
 /* ================= Webhook ================= */
@@ -56,19 +92,32 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 /* ================= 主流程 ================= */
 
 async function handleEvent(event) {
+  const userId = event.source.userId;
+
+  // 只處理文字（Rich Menu 也是 text）
   if (event.type !== "message" || event.message.type !== "text") return;
 
   const text = event.message.text.trim();
-  const userId = event.source.userId;
+
+  /* ===== 查員工 ===== */
 
   const emp = await getEmployee(userId);
-  if (!emp)
+
+  // 未註冊 → 強制 Entry Menu
+  if (!emp) {
+    if (RM_ENTRY) {
+      await client.linkRichMenuToUser(userId, RM_ENTRY);
+    }
     return reply(event, {
       type: "text",
       text: "❌ 尚未註冊\n請輸入：註冊 A001",
     });
+  }
 
-  /* ========= 打卡 ========= */
+  // 已註冊 → 自動分流 Rich Menu
+  await applyRichMenuByRole(userId, emp);
+
+  /* ================= 打卡 ================= */
 
   if (text === "CLOCK") {
     return reply(event, {
@@ -89,7 +138,7 @@ async function handleEvent(event) {
     return handleClock(event, emp, text);
   }
 
-  /* ========= 補打卡 ========= */
+  /* ================= 補打卡 ================= */
 
   if (text === "MAKEUP_APPLY") {
     return startMakeupFlow(event, emp);
@@ -111,16 +160,17 @@ async function handleEvent(event) {
     return submitMakeup(event, emp, text);
   }
 
-  /* ========= 核准 ========= */
+  /* ================= 核准 ================= */
 
   if (text.startsWith("MAKEUP|")) {
     return handleMakeupDecision(event, emp, text);
   }
 
-  return reply(event, { type: "text", text: "❓ 請使用選單操作" });
+  // 封死亂打字（企業內部系統推薦）
+  return null;
 }
 
-/* ================= 打卡 ================= */
+/* ================= 打卡處理 ================= */
 
 async function handleClock(event, emp, text) {
   const map = {
@@ -151,10 +201,6 @@ async function handleClock(event, emp, text) {
 }
 
 /* ================= 補打卡流程 ================= */
-
-function qr(text) {
-  return { type: "action", action: { type: "message", label: text, text } };
-}
 
 async function startMakeupFlow(event, emp) {
   const dates = [];
@@ -231,19 +277,17 @@ async function submitMakeup(event, emp, text) {
   return reply(event, { type: "text", text: "📨 已送出補打卡申請" });
 }
 
-/* ================= 核准 ================= */
+/* ================= 核准流程 ================= */
 
 async function notifyApprovers(emp, date, shift, action, reason, id) {
-  const snap = await db
-    .collection("employees")
-    .where("canApprove", "==", true)
-    .get();
+  const snap = await db.collection("employees").get();
 
   for (const doc of snap.docs) {
-    const u = doc.data().userId;
-    if (!u) continue;
+    const u = doc.data();
+    if (!u.userId) continue;
+    if (!(u.role === "admin" || u.canApprove === true)) continue;
 
-    await client.pushMessage(u, {
+    await client.pushMessage(u.userId, {
       type: "text",
       text:
         `📌 補打卡申請\n員工：${emp.empKey}\n日期：${date}\n班別：${shift}\n動作：${action}\n原因：${reason}`,
@@ -258,8 +302,9 @@ async function notifyApprovers(emp, date, shift, action, reason, id) {
 }
 
 async function handleMakeupDecision(event, emp, text) {
-  if (!emp.canApprove)
+  if (!canApproveMakeup(emp)) {
     return reply(event, { type: "text", text: "❌ 無權限" });
+  }
 
   const [, action, id] = text.split("|");
   const ref = db.collection("makeupRequests").doc(id);
